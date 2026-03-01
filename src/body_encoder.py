@@ -1,99 +1,23 @@
-"""
-body_encoder.py
-═══════════════════════════════════════════════════════════════
-
-  "For body shape, we accompany estimated 3D parameters (10-D)
-   with vital statistics (4-D). Each is first reduced into a
-   lower dimensional space with learned projection functions
-   h_smpl, h_meas. Then the reduced features are concatenated
-   as the representation xb for body shape and forwarded into
-   the joint embedding by f_body."
-
-   "All dimensionality reduction functions h_attr, h_cnn,
-    h_smpl, h_meas are 2-layer MLPs, and the embedding
-    functions f_cloth and f_body are single fully connected
-    layers."
-    
-  We use 7 body measurements from MediaPipe as input
-  instead of SMPL(10D) + vital_stats(4D).
-  
-Rules:
-  ✓ input_dim  = 7   (body measurements)
-  ✓ output_dim = 128 (embedding)
-  ✓ Does NOT touch dataset
-  ✓ Does NOT contain training logic
-  ✓ Only produces embeddings
-
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-
-# ═══════════════════════════════════════════════════════════════
-# THE 7 INPUT FEATURES
-# ═══════════════════════════════════════════════════════════════
-#
-#  Index | Feature               | Source
-#  ──────────────────────────────────────────────────────────
-#    0   | height (normalized)   | nose → ankle distance
-#    1   | bust  (normalized)    | shoulder width × 1.3
-#    2   | waist (normalized)    | hip width × 0.85
-#    3   | hip   (normalized)    | left_hip → right_hip
-#    4   | shoulder_width        | left_shoulder → right_shoulder
-#    5   | shoulder_hip_ratio    | shoulder / hip
-#    6   | torso_height          | shoulder_mid → hip_mid
-#
-# ═══════════════════════════════════════════════════════════════
-
-
 class BodyEncoder(nn.Module):
-    """
-    Body Measurement Encoder
-
-    Maps 7-dim body measurement vector → 128-dim embedding.
-
-    Implements h_meas + f_body :
-
-        h_meas : 2-layer MLP (dimensionality reduction)
-        f_body : single FC layer (projects to embedding space)
-        L2 norm: constrains to unit hypersphere (Section 3.3)
-
-    Full Architecture:
-        Input (7)
-          ↓
-        ┌─────────────────────────────┐
-        │  h_meas  (2-layer MLP)      │
-        │  Linear(7→32) + BN + ReLU  │
-        │  Linear(32→64) + BN + ReLU │
-        └─────────────────────────────┘
-          ↓
-        ┌─────────────────────────────┐
-        │  f_body  (single FC layer)  │
-        │  Linear(64→128)             │
-        └─────────────────────────────┘
-          ↓
-        L2 Normalize (unit hypersphere)
-          ↓
-        Output (128-dim continuous embedding)
-    """
-
+    
     def __init__(self, input_dim=7, embedding_dim=128):
         super(BodyEncoder, self).__init__()
 
-        self.input_dim     = input_dim       # 7 body measurements
-        self.embedding_dim = embedding_dim   # 128-dim output
+        self.input_dim     = input_dim       
+        self.embedding_dim = embedding_dim   
 
         self.h_meas = nn.Sequential(
 
-            # Layer 1: 7 → 32
-            nn.Linear(input_dim, 32),
+           nn.Linear(input_dim, 32),
             nn.BatchNorm1d(32),
             nn.ReLU(),
 
-            # Layer 2: 32 → 64
+          
             nn.Linear(32, 64),
             nn.BatchNorm1d(64),
             nn.ReLU(),
@@ -101,7 +25,6 @@ class BodyEncoder(nn.Module):
 
         self.f_body = nn.Linear(64, embedding_dim)
 
-        # Initialize weights
         self._init_weights()
 
     def _init_weights(self):
@@ -115,36 +38,17 @@ class BodyEncoder(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        """
-        Args:
-            x : Tensor (batch_size, 7) — standardized measurements
+        
+        reduced   = self.h_meas(x)           
+      
+        embedding = self.f_body(reduced)     
 
-        Returns:
-            embedding : Tensor (batch_size, 128)
-                        L2-normalized, on unit hypersphere
-                        CONTINUOUS — unique per person
-        """
-        # h_meas: reduce to compact representation
-        reduced   = self.h_meas(x)           # (batch, 7) → (batch, 64)
-
-        # f_body: project to embedding space
-        embedding = self.f_body(reduced)     # (batch, 64) → (batch, 128)
-
-        # L2 normalize — unit hypersphere (paper Section 3.3)
         embedding = F.normalize(embedding, p=2, dim=1)
 
-        return embedding                     # (batch, 128)
+        return embedding                   
 
     def get_embedding(self, measurements):
-        """
-        Convenience: numpy → numpy embedding.
-
-        Args:
-            measurements : numpy (7,) or (N, 7)
-
-        Returns:
-            embedding    : numpy (128,) or (N, 128)
-        """
+        
         squeeze = (measurements.ndim == 1)
         if squeeze:
             measurements = measurements[np.newaxis, :]
@@ -158,19 +62,10 @@ class BodyEncoder(nn.Module):
         return result[0] if squeeze else result
 
 
-# BODY MEASUREMENT EXTRACTOR
-# Extracts the 7 features from a person image
-
 class BodyMeasurementExtractor:
-    """
-    Extracts 7-dim body measurement vector from an image
-    using MediaPipe Pose — matches BodyEncoder input_dim=7.
-    """
-
+   
     def extract(self, image_path):
-        """
-        Returns numpy (7,) or zeros if no pose detected.
-        """
+       
         import cv2
         import mediapipe as mp
 
@@ -224,8 +119,6 @@ class BodyMeasurementExtractor:
             shoulder_w, shoulder_hip_ratio, torso_h
         ], dtype=np.float32)
 
-# QUICK TEST
-
 if __name__ == "__main__":
     print("=" * 55)
     print("  BodyEncoder — ViBE Paper Architecture")
@@ -251,3 +144,4 @@ if __name__ == "__main__":
     print(f"  L2 norms      : {output.norm(dim=1).tolist()}")
     print(f"  (All should be exactly 1.0)\n")
     print(f"   BodyEncoder ready — 128-dim continuous embeddings")
+
