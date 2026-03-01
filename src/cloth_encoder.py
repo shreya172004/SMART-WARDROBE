@@ -65,7 +65,7 @@ class ClothEncoder(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, x)
+    def forward(self, x):
   
         features  = self.backbone(x)            
         features  = features.view(features.size(0), -1)  
