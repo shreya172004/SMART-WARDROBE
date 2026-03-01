@@ -42,8 +42,8 @@ class BodyClothDataset(Dataset):
 
         # Body vector
         body_vector = torch.tensor(
-            row.drop("image").values,
-            dtype=torch.float32
+        row.drop("image").to_numpy(dtype=float),
+        dtype=torch.float32
         )
 
         # Positive image
