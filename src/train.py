@@ -1,5 +1,4 @@
 import os
-import shutil
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -13,12 +12,28 @@ from model import ViBEModel
 
 
 # =========================
-# PATHS
+# PATHS (DIRECT TO DRIVE)
 # =========================
 
 CHECKPOINT_PATH = "/content/drive/MyDrive/SmartWardrobe/checkpoint.pth"
 BEST_MODEL_PATH = "/content/drive/MyDrive/SmartWardrobe/best_vibe_model.pth"
-DRIVE_MODEL_PATH = "/content/drive/MyDrive/SmartWardrobe/best_vibe_model.pth"
+
+
+def save_checkpoint(epoch, batch_idx, model, optimizer,
+                    train_losses, val_losses,
+                    train_accs, val_accs, best_val_loss):
+
+    torch.save({
+        "epoch": epoch,
+        "batch_idx": batch_idx,
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "train_accs": train_accs,
+        "val_accs": val_accs,
+        "best_val_loss": best_val_loss
+    }, CHECKPOINT_PATH)
 
 
 def train():
@@ -76,6 +91,7 @@ def train():
     # =========================
 
     start_epoch = 0
+    start_batch = 0
     train_losses, val_losses = [], []
     train_accs, val_accs = [], []
     best_val_loss = float("inf")
@@ -86,7 +102,8 @@ def train():
 
         model.load_state_dict(checkpoint["model_state"])
         optimizer.load_state_dict(checkpoint["optimizer_state"])
-        start_epoch = checkpoint["epoch"] + 1
+        start_epoch = checkpoint["epoch"]
+        start_batch = checkpoint.get("batch_idx", 0)
 
         train_losses = checkpoint["train_losses"]
         val_losses = checkpoint["val_losses"]
@@ -94,7 +111,7 @@ def train():
         val_accs = checkpoint["val_accs"]
         best_val_loss = checkpoint["best_val_loss"]
 
-        print(f"Resumed from epoch {start_epoch}")
+        print(f"Resumed from epoch {start_epoch}, batch {start_batch}")
 
     # =========================
     # TRAIN LOOP
@@ -102,15 +119,18 @@ def train():
 
     for epoch in range(start_epoch, config.EPOCHS):
 
-        # -------- TRAIN --------
         model.train()
         running_loss = 0.0
         correct = 0
         total = 0
 
-        loop = tqdm(train_loader)
+        loop = tqdm(enumerate(train_loader), total=len(train_loader),
+                    desc=f"Train Epoch {epoch+1}")
 
-        for body_vec, pos_img, neg_img in loop:
+        for batch_idx, (body_vec, pos_img, neg_img) in loop:
+
+            if epoch == start_epoch and batch_idx < start_batch:
+                continue  # skip already processed batches
 
             body_vec = body_vec.to(device)
             pos_img = pos_img.to(device)
@@ -134,17 +154,28 @@ def train():
             correct += (pos_dist < neg_dist).sum().item()
             total += body_vec.size(0)
 
+            # 🔥 SAVE MID-EPOCH EVERY 200 BATCHES
+            if batch_idx % 200 == 0 and batch_idx != 0:
+                save_checkpoint(epoch, batch_idx, model, optimizer,
+                                train_losses, val_losses,
+                                train_accs, val_accs, best_val_loss)
+                print(f"Mid-epoch checkpoint saved at batch {batch_idx}")
+
         avg_train_loss = running_loss / len(train_loader)
         train_acc = correct / total
 
-        # -------- VALIDATION --------
+        # =========================
+        # VALIDATION WITH TQDM
+        # =========================
+
         model.eval()
         val_running_loss = 0.0
         val_correct = 0
         val_total = 0
 
         with torch.no_grad():
-            for body_vec, pos_img, neg_img in val_loader:
+            val_loop = tqdm(val_loader, desc=f"Validation Epoch {epoch+1}")
+            for body_vec, pos_img, neg_img in val_loop:
 
                 body_vec = body_vec.to(device)
                 pos_img = pos_img.to(device)
@@ -175,36 +206,18 @@ def train():
         print(f"Train Loss: {avg_train_loss:.4f} | Train Acc: {train_acc:.4f}")
         print(f"Val   Loss: {avg_val_loss:.4f} | Val   Acc: {val_acc:.4f}")
 
-        # -------- SAVE BEST MODEL --------
+        # 🔥 SAVE BEST MODEL DIRECTLY TO DRIVE
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             torch.save(model.state_dict(), BEST_MODEL_PATH)
-            print("Best model updated.")
+            print("Best model updated (Drive).")
 
-        # -------- SAVE CHECKPOINT --------
-        torch.save({
-            "epoch": epoch,
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "train_losses": train_losses,
-            "val_losses": val_losses,
-            "train_accs": train_accs,
-            "val_accs": val_accs,
-            "best_val_loss": best_val_loss
-        }, CHECKPOINT_PATH)
+        # 🔥 SAVE CHECKPOINT AFTER EVERY EPOCH
+        save_checkpoint(epoch + 1, 0, model, optimizer,
+                        train_losses, val_losses,
+                        train_accs, val_accs, best_val_loss)
 
-        print("Checkpoint saved.")
-
-    # =========================
-    # COPY BEST MODEL TO DRIVE
-    # =========================
-
-    try:
-        if os.path.exists(BEST_MODEL_PATH):
-            shutil.copy(BEST_MODEL_PATH, DRIVE_MODEL_PATH)
-            print("Best model copied to Drive.")
-    except Exception as e:
-        print("Drive copy failed:", e)
+        print("Epoch checkpoint saved.")
 
     # =========================
     # PLOT CURVES
