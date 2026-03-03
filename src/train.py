@@ -16,8 +16,8 @@ from model import ViBEModel
 # PATHS
 # =========================
 
-CHECKPOINT_PATH = "/content/checkpoint.pth"
-BEST_MODEL_PATH = "/content/best_vibe_model.pth"
+CHECKPOINT_PATH = "/content/drive/MyDrive/SmartWardrobe/checkpoint.pth"
+BEST_MODEL_PATH = "/content/drive/MyDrive/SmartWardrobe/best_vibe_model.pth"
 DRIVE_MODEL_PATH = "/content/drive/MyDrive/SmartWardrobe/best_vibe_model.pth"
 
 
