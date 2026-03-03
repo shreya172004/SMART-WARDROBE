@@ -1,5 +1,5 @@
 import os
-import sys
+import shutil
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,6 +10,15 @@ from tqdm import tqdm
 import config
 from dataset import BodyClothDataset
 from model import ViBEModel
+
+
+# =========================
+# PATHS
+# =========================
+
+CHECKPOINT_PATH = "/content/checkpoint.pth"
+BEST_MODEL_PATH = "/content/best_vibe_model.pth"
+DRIVE_MODEL_PATH = "/content/drive/MyDrive/SmartWardrobe/best_vibe_model.pth"
 
 
 def train():
@@ -63,21 +72,35 @@ def train():
     optimizer = optim.Adam(model.parameters(), lr=config.LR)
 
     # =========================
-    # METRIC STORAGE
+    # RESUME LOGIC
     # =========================
 
-    train_losses = []
-    val_losses = []
-    train_accs = []
-    val_accs = []
-
+    start_epoch = 0
+    train_losses, val_losses = [], []
+    train_accs, val_accs = [], []
     best_val_loss = float("inf")
 
+    if os.path.exists(CHECKPOINT_PATH):
+        print("Resuming from checkpoint...")
+        checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+
+        model.load_state_dict(checkpoint["model_state"])
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        start_epoch = checkpoint["epoch"] + 1
+
+        train_losses = checkpoint["train_losses"]
+        val_losses = checkpoint["val_losses"]
+        train_accs = checkpoint["train_accs"]
+        val_accs = checkpoint["val_accs"]
+        best_val_loss = checkpoint["best_val_loss"]
+
+        print(f"Resumed from epoch {start_epoch}")
+
     # =========================
-    # TRAINING LOOP
+    # TRAIN LOOP
     # =========================
 
-    for epoch in range(config.EPOCHS):
+    for epoch in range(start_epoch, config.EPOCHS):
 
         # -------- TRAIN --------
         model.train()
@@ -105,7 +128,6 @@ def train():
 
             running_loss += loss.item()
 
-            # Accuracy (pos distance < neg distance)
             pos_dist = torch.norm(body_emb - pos_emb, dim=1)
             neg_dist = torch.norm(body_emb - neg_emb, dim=1)
 
@@ -114,9 +136,6 @@ def train():
 
         avg_train_loss = running_loss / len(train_loader)
         train_acc = correct / total
-
-        train_losses.append(avg_train_loss)
-        train_accs.append(train_acc)
 
         # -------- VALIDATION --------
         model.eval()
@@ -147,55 +166,67 @@ def train():
         avg_val_loss = val_running_loss / len(val_loader)
         val_acc = val_correct / val_total
 
+        train_losses.append(avg_train_loss)
         val_losses.append(avg_val_loss)
+        train_accs.append(train_acc)
         val_accs.append(val_acc)
 
         print(f"\nEpoch [{epoch+1}/{config.EPOCHS}]")
         print(f"Train Loss: {avg_train_loss:.4f} | Train Acc: {train_acc:.4f}")
         print(f"Val   Loss: {avg_val_loss:.4f} | Val   Acc: {val_acc:.4f}")
 
-        # -------- SAVE BEST MODEL (LOCAL ONLY) --------
+        # -------- SAVE BEST MODEL --------
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), "/content/best_vibe_model.pth")
-            print("Best model saved locally.")
+            torch.save(model.state_dict(), BEST_MODEL_PATH)
+            print("Best model updated.")
+
+        # -------- SAVE CHECKPOINT --------
+        torch.save({
+            "epoch": epoch,
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "train_losses": train_losses,
+            "val_losses": val_losses,
+            "train_accs": train_accs,
+            "val_accs": val_accs,
+            "best_val_loss": best_val_loss
+        }, CHECKPOINT_PATH)
+
+        print("Checkpoint saved.")
+
+    # =========================
+    # COPY BEST MODEL TO DRIVE
+    # =========================
+
+    try:
+        if os.path.exists(BEST_MODEL_PATH):
+            shutil.copy(BEST_MODEL_PATH, DRIVE_MODEL_PATH)
+            print("Best model copied to Drive.")
+    except Exception as e:
+        print("Drive copy failed:", e)
 
     # =========================
     # PLOT CURVES
     # =========================
 
-    epochs = range(1, config.EPOCHS + 1)
+    epochs = range(1, len(train_losses) + 1)
 
     plt.figure(figsize=(12,5))
 
     plt.subplot(1,2,1)
-    plt.plot(epochs, train_losses, label="Train Loss")
-    plt.plot(epochs, val_losses, label="Val Loss")
+    plt.plot(epochs, train_losses, label="Train")
+    plt.plot(epochs, val_losses, label="Val")
+    plt.title("Loss")
     plt.legend()
-    plt.title("Loss Curve")
 
     plt.subplot(1,2,2)
-    plt.plot(epochs, train_accs, label="Train Acc")
-    plt.plot(epochs, val_accs, label="Val Acc")
+    plt.plot(epochs, train_accs, label="Train")
+    plt.plot(epochs, val_accs, label="Val")
+    plt.title("Accuracy")
     plt.legend()
-    plt.title("Accuracy Curve")
 
     plt.show()
-
-    # =========================
-    # COPY TO DRIVE (SAFE)
-    # =========================
-
-    try:
-        import shutil
-        drive_path = "/content/drive/MyDrive/SmartWardrobe/best_vibe_model.pth"
-
-        if os.path.exists("/content/best_vibe_model.pth"):
-            shutil.copy("/content/best_vibe_model.pth", drive_path)
-            print("Model copied to Drive successfully.")
-
-    except Exception as e:
-        print("Drive copy failed:", e)
 
 
 if __name__ == "__main__":
