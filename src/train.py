@@ -1,23 +1,25 @@
+import os
+import sys
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+import torch.optim as optim
 import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader
 from tqdm import tqdm
-import os
 
+import config
 from dataset import BodyClothDataset
 from model import ViBEModel
-import config
 
 
 def train():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Using device:", device)
+    print(f"\nUsing device: {device}")
 
-    # =============================
+    # =========================
     # DATASETS
-    # =============================
+    # =========================
 
     train_dataset = BodyClothDataset(
         image_dir=config.TRAIN_DIR,
@@ -29,22 +31,28 @@ def train():
         body_csv=config.BODY_VECTOR_CSV
     )
 
-    train_loader = DataLoader(train_dataset,
-                              batch_size=config.BATCH_SIZE,
-                              shuffle=True,
-                              num_workers=2)
+    print(f"Training samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
 
-    val_loader = DataLoader(val_dataset,
-                            batch_size=config.BATCH_SIZE,
-                            shuffle=False,
-                            num_workers=2)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True
+    )
 
-    print("Training samples:", len(train_dataset))
-    print("Validation samples:", len(val_dataset))
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True
+    )
 
-    # =============================
+    # =========================
     # MODEL
-    # =============================
+    # =========================
 
     model = ViBEModel(
         body_input_dim=7,
@@ -52,11 +60,11 @@ def train():
     ).to(device)
 
     criterion = nn.TripletMarginLoss(margin=1.0)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.LR)
+    optimizer = optim.Adam(model.parameters(), lr=config.LR)
 
-    # =============================
+    # =========================
     # METRIC STORAGE
-    # =============================
+    # =========================
 
     train_losses = []
     val_losses = []
@@ -65,17 +73,17 @@ def train():
 
     best_val_loss = float("inf")
 
-    # =============================
+    # =========================
     # TRAINING LOOP
-    # =============================
+    # =========================
 
     for epoch in range(config.EPOCHS):
 
-        # ---- TRAIN ----
+        # -------- TRAIN --------
         model.train()
-        total_train_loss = 0
-        correct_train = 0
-        total_train = 0
+        running_loss = 0.0
+        correct = 0
+        total = 0
 
         loop = tqdm(train_loader)
 
@@ -85,36 +93,36 @@ def train():
             pos_img = pos_img.to(device)
             neg_img = neg_img.to(device)
 
+            optimizer.zero_grad()
+
             body_emb = model.encode_body(body_vec)
             pos_emb = model.encode_cloth(pos_img)
             neg_emb = model.encode_cloth(neg_img)
 
             loss = criterion(body_emb, pos_emb, neg_emb)
-
-            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            total_train_loss += loss.item()
+            running_loss += loss.item()
 
-            # Triplet accuracy
+            # Accuracy (pos distance < neg distance)
             pos_dist = torch.norm(body_emb - pos_emb, dim=1)
             neg_dist = torch.norm(body_emb - neg_emb, dim=1)
 
-            correct_train += (pos_dist < neg_dist).sum().item()
-            total_train += body_vec.size(0)
+            correct += (pos_dist < neg_dist).sum().item()
+            total += body_vec.size(0)
 
-        avg_train_loss = total_train_loss / len(train_loader)
-        train_accuracy = correct_train / total_train
+        avg_train_loss = running_loss / len(train_loader)
+        train_acc = correct / total
 
         train_losses.append(avg_train_loss)
-        train_accs.append(train_accuracy)
+        train_accs.append(train_acc)
 
-        # ---- VALIDATION ----
+        # -------- VALIDATION --------
         model.eval()
-        total_val_loss = 0
-        correct_val = 0
-        total_val = 0
+        val_running_loss = 0.0
+        val_correct = 0
+        val_total = 0
 
         with torch.no_grad():
             for body_vec, pos_img, neg_img in val_loader:
@@ -128,55 +136,66 @@ def train():
                 neg_emb = model.encode_cloth(neg_img)
 
                 loss = criterion(body_emb, pos_emb, neg_emb)
-                total_val_loss += loss.item()
+                val_running_loss += loss.item()
 
                 pos_dist = torch.norm(body_emb - pos_emb, dim=1)
                 neg_dist = torch.norm(body_emb - neg_emb, dim=1)
 
-                correct_val += (pos_dist < neg_dist).sum().item()
-                total_val += body_vec.size(0)
+                val_correct += (pos_dist < neg_dist).sum().item()
+                val_total += body_vec.size(0)
 
-        avg_val_loss = total_val_loss / len(val_loader)
-        val_accuracy = correct_val / total_val
+        avg_val_loss = val_running_loss / len(val_loader)
+        val_acc = val_correct / val_total
 
         val_losses.append(avg_val_loss)
-        val_accs.append(val_accuracy)
+        val_accs.append(val_acc)
 
         print(f"\nEpoch [{epoch+1}/{config.EPOCHS}]")
-        print(f"Train Loss: {avg_train_loss:.4f} | Train Acc: {train_accuracy:.4f}")
-        print(f"Val   Loss: {avg_val_loss:.4f} | Val   Acc: {val_accuracy:.4f}")
+        print(f"Train Loss: {avg_train_loss:.4f} | Train Acc: {train_acc:.4f}")
+        print(f"Val   Loss: {avg_val_loss:.4f} | Val   Acc: {val_acc:.4f}")
 
-        # Save best model
+        # -------- SAVE BEST MODEL (LOCAL ONLY) --------
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            torch.save(
-                model.state_dict(),
-                "/content/drive/MyDrive/SmartWardrobe/best_vibe_model.pth"
-            )
-            print("Best model saved!")
+            torch.save(model.state_dict(), "/content/best_vibe_model.pth")
+            print("Best model saved locally.")
 
-    # =============================
+    # =========================
     # PLOT CURVES
-    # =============================
+    # =========================
+
+    epochs = range(1, config.EPOCHS + 1)
 
     plt.figure(figsize=(12,5))
 
     plt.subplot(1,2,1)
-    plt.plot(train_losses, label="Train Loss")
-    plt.plot(val_losses, label="Val Loss")
+    plt.plot(epochs, train_losses, label="Train Loss")
+    plt.plot(epochs, val_losses, label="Val Loss")
     plt.legend()
     plt.title("Loss Curve")
 
     plt.subplot(1,2,2)
-    plt.plot(train_accs, label="Train Acc")
-    plt.plot(val_accs, label="Val Acc")
+    plt.plot(epochs, train_accs, label="Train Acc")
+    plt.plot(epochs, val_accs, label="Val Acc")
     plt.legend()
     plt.title("Accuracy Curve")
 
-    plt.savefig("/content/drive/MyDrive/SmartWardrobe/training_curves.png")
     plt.show()
 
-    print("Training complete.")
+    # =========================
+    # COPY TO DRIVE (SAFE)
+    # =========================
+
+    try:
+        import shutil
+        drive_path = "/content/drive/MyDrive/SmartWardrobe/best_vibe_model.pth"
+
+        if os.path.exists("/content/best_vibe_model.pth"):
+            shutil.copy("/content/best_vibe_model.pth", drive_path)
+            print("Model copied to Drive successfully.")
+
+    except Exception as e:
+        print("Drive copy failed:", e)
 
 
 if __name__ == "__main__":
