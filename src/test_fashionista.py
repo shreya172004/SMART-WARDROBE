@@ -89,7 +89,7 @@ top5 = 0
 
 for _,row in tqdm(df.iterrows(), total=len(df)):
 
-    body_vec = row.values[1:]
+    body_vec = row.values[1:].astype(np.float32)
 
     body_emb = encode_body(body_vec)
 
