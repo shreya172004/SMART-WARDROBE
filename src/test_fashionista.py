@@ -3,26 +3,44 @@ import torchvision.transforms as transforms
 from pathlib import Path
 from PIL import Image
 import numpy as np
-from tqdm import tqdm
 import pandas as pd
+from tqdm import tqdm
 
 from model import ViBEModel
 
 
+# =========================
+# PATHS
+# =========================
+
 MODEL_PATH = "/content/drive/MyDrive/SmartWardrobe/best_vibe_model.pth"
 
 TEST_DIR = "/content/drive/MyDrive/SmartWardrobe/body_shape_recommendor/data/split/test"
+
 BODY_CSV = "/content/drive/MyDrive/SmartWardrobe/body_shape_recommendor/data/body_vectors.csv"
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# =========================
+# DEVICE
+# =========================
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+
+# =========================
+# IMAGE TRANSFORM
+# =========================
 
 transform = transforms.Compose([
     transforms.Resize((224,224)),
     transforms.ToTensor()
 ])
 
+
+# =========================
+# LOAD MODEL
+# =========================
 
 model = ViBEModel(
     body_input_dim=7,
@@ -32,6 +50,10 @@ model = ViBEModel(
 model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
 model.eval()
 
+
+# =========================
+# ENCODERS
+# =========================
 
 def encode_cloth(path):
 
@@ -49,7 +71,7 @@ def encode_cloth(path):
 
 def encode_body(vec):
 
-    vec = torch.tensor(vec).float().unsqueeze(0).to(device)
+    vec = torch.tensor(vec, dtype=torch.float32).unsqueeze(0).to(device)
 
     with torch.no_grad():
         emb = model.encode_body(vec)
@@ -60,32 +82,54 @@ def encode_body(vec):
     return emb
 
 
-print("Loading body vectors...")
+# =========================
+# LOAD BODY CSV
+# =========================
+
+print("\nLoading body vectors...")
 
 df = pd.read_csv(BODY_CSV)
 
-
-print("Computing clothing embeddings...")
-
 cloth_paths = list(Path(TEST_DIR).glob("*.jpg"))
 
+cloth_names = [p.name for p in cloth_paths]
+
+# Keep only rows that exist in test set
+df = df[df["image"].isin(cloth_names)]
+
+df = df.reset_index(drop=True)
+
+print("Test samples:", len(df))
+
+
+# =========================
+# COMPUTE CLOTH EMBEDDINGS
+# =========================
+
+print("\nComputing clothing embeddings...")
+
 cloth_embeddings = []
-cloth_names = []
+cloth_images = []
 
 for p in tqdm(cloth_paths):
 
     emb = encode_cloth(p)
 
     cloth_embeddings.append(emb)
-    cloth_names.append(p.name)
+    cloth_images.append(p.name)
 
 cloth_embeddings = np.array(cloth_embeddings)
 
 
-print("Running recommendation evaluation...")
+# =========================
+# EVALUATION
+# =========================
+
+print("\nRunning recommendation evaluation...")
 
 top1 = 0
 top5 = 0
+top10 = 0
 
 for _,row in tqdm(df.iterrows(), total=len(df)):
 
@@ -93,23 +137,35 @@ for _,row in tqdm(df.iterrows(), total=len(df)):
 
     body_emb = encode_body(body_vec)
 
-    dists = -np.dot(cloth_embeddings, body_emb)
+    # cosine similarity
+    scores = np.dot(cloth_embeddings, body_emb)
 
-    idx = np.argsort(dists)
+    idx = np.argsort(-scores)
 
-    ranked = [cloth_names[i] for i in idx]
+    ranked = [cloth_images[i] for i in idx]
 
-    correct_item = row["image"]
+    gt = row["image"]
 
-    if correct_item in ranked[:1]:
+    if gt in ranked[:1]:
         top1 += 1
 
-    if correct_item in ranked[:5]:
+    if gt in ranked[:5]:
         top5 += 1
 
+    if gt in ranked[:10]:
+        top10 += 1
+
+
+# =========================
+# RESULTS
+# =========================
 
 n = len(df)
 
-print("\nRESULTS")
-print("Top1 Accuracy:", top1/n)
-print("Top5 Accuracy:", top5/n)
+print("\n======================")
+print("FASHIONISTA RESULTS")
+print("======================")
+
+print("Top1 Accuracy :", round(top1/n,4))
+print("Top5 Accuracy :", round(top5/n,4))
+print("Top10 Accuracy:", round(top10/n,4))

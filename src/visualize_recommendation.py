@@ -35,6 +35,9 @@ model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
 model.eval()
 
 
+# ----------------------------
+# Encode clothing image
+# ----------------------------
 def encode_cloth(path):
 
     img = Image.open(path).convert("RGB")
@@ -49,6 +52,9 @@ def encode_cloth(path):
     return emb
 
 
+# ----------------------------
+# Encode body vector
+# ----------------------------
 def encode_body(vec):
 
     vec = torch.tensor(vec).float().unsqueeze(0).to(device)
@@ -63,7 +69,6 @@ def encode_body(vec):
 
 
 print("Loading body vectors...")
-
 df = pd.read_csv(BODY_CSV)
 
 
@@ -84,13 +89,14 @@ for p in tqdm(cloth_paths):
 cloth_embeddings = np.array(cloth_embeddings)
 
 
-print("Showing recommendations...")
+print("Showing recommendation examples...")
 
 for i in range(5):
 
     row = df.iloc[i]
 
     body_vec = row.values[1:]
+    gt_image_name = row["image"]
 
     body_emb = encode_body(body_vec)
 
@@ -98,13 +104,27 @@ for i in range(5):
 
     idx = np.argsort(scores)[:5]
 
-    retrieved = [cloth_images[i] for i in idx]
+    retrieved = [cloth_images[j] for j in idx]
 
-    plt.figure(figsize=(15,3))
+    gt_path = Path(TEST_DIR) / gt_image_name
 
+    plt.figure(figsize=(18,3))
+
+    # Ground truth
+    plt.subplot(1,6,1)
+
+    if gt_path.exists():
+        plt.imshow(Image.open(gt_path))
+        plt.title("Ground Truth")
+    else:
+        plt.text(0.5,0.5,"GT Missing",ha="center")
+
+    plt.axis("off")
+
+    # Recommendations
     for j,img in enumerate(retrieved):
 
-        plt.subplot(1,5,j+1)
+        plt.subplot(1,6,j+2)
         plt.imshow(Image.open(img))
         plt.axis("off")
         plt.title(f"Top {j+1}")
