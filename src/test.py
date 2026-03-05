@@ -1,6 +1,5 @@
 import torch
 import torchvision.transforms as transforms
-from torchvision.models import resnet50
 from PIL import Image
 from pathlib import Path
 import numpy as np
@@ -8,23 +7,22 @@ from tqdm import tqdm
 
 from model import ViBEModel
 
-# paths
+
 QUERY_DIR = "/content/drive/MyDrive/SmartWardrobe/deepfashion_test_subset/queries"
 GALLERY_DIR = "/content/drive/MyDrive/SmartWardrobe/deepfashion_test_subset/gallery"
 
 MODEL_PATH = "/content/drive/MyDrive/SmartWardrobe/best_vibe_model.pth"
 
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# image transform
 transform = transforms.Compose([
     transforms.Resize((224,224)),
     transforms.ToTensor()
 ])
 
 
-# load model
 model = ViBEModel(
     body_input_dim=7,
     embedding_dim=128
@@ -45,19 +43,33 @@ def extract_embedding(img_path):
     return emb.cpu().numpy()[0]
 
 
+def extract_clothing_id(path):
+
+    # example filename
+    # WOMEN_Dresses_id_00004435_02_1_front.jpg
+
+    parts = path.name.split("_")
+
+    for i,p in enumerate(parts):
+        if p == "id":
+            return parts[i] + "_" + parts[i+1]
+
+    return None
+
+
 print("Computing gallery embeddings...")
 
 gallery_paths = list(Path(GALLERY_DIR).glob("*.jpg"))
 
 gallery_embeddings = []
-gallery_names = []
+gallery_ids = []
 
 for p in tqdm(gallery_paths):
 
     emb = extract_embedding(p)
 
     gallery_embeddings.append(emb)
-    gallery_names.append(p.name)
+    gallery_ids.append(extract_clothing_id(p))
 
 gallery_embeddings = np.array(gallery_embeddings)
 
@@ -74,22 +86,21 @@ for q in tqdm(query_paths):
 
     q_emb = extract_embedding(q)
 
-    # compute distance
+    q_id = extract_clothing_id(q)
+
     dists = np.linalg.norm(gallery_embeddings - q_emb, axis=1)
 
     idx = np.argsort(dists)
 
-    ranked = [gallery_names[i] for i in idx]
+    ranked_ids = [gallery_ids[i] for i in idx]
 
-    qname = q.name
-
-    if qname in ranked[:1]:
+    if q_id in ranked_ids[:1]:
         recall1 += 1
 
-    if qname in ranked[:5]:
+    if q_id in ranked_ids[:5]:
         recall5 += 1
 
-    if qname in ranked[:10]:
+    if q_id in ranked_ids[:10]:
         recall10 += 1
 
 

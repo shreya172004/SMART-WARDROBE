@@ -13,6 +13,17 @@ GALLERY_DIR = "/content/drive/MyDrive/SmartWardrobe/deepfashion_test_subset/gall
 
 MODEL_PATH = "/content/drive/MyDrive/SmartWardrobe/best_vibe_model.pth"
 
+def extract_clothing_id(path):
+
+    parts = path.name.split("_")
+
+    for i,p in enumerate(parts):
+        if p == "id":
+            return parts[i] + "_" + parts[i+1]
+
+    return "unknown"
+
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 transform = transforms.Compose([
@@ -37,7 +48,10 @@ def extract_embedding(img_path):
     with torch.no_grad():
         emb = model.encode_cloth(img)
 
-    return emb.cpu().numpy()[0]
+    emb = emb.cpu().numpy()[0]
+    emb = emb / np.linalg.norm(emb)
+
+    return emb
 
 
 print("Computing gallery embeddings...")
@@ -61,7 +75,7 @@ print("Running visual retrieval...")
 
 query_paths = list(Path(QUERY_DIR).glob("*.jpg"))
 
-for q in query_paths[:5]:  # show 5 examples
+for q in query_paths[:5]:
 
     q_emb = extract_embedding(q)
 
@@ -75,14 +89,14 @@ for q in query_paths[:5]:  # show 5 examples
 
     plt.subplot(1,6,1)
     plt.imshow(Image.open(q))
-    plt.title("Query")
+    plt.title(extract_clothing_id(q))
     plt.axis("off")
 
     for i,img in enumerate(retrieved):
 
         plt.subplot(1,6,i+2)
         plt.imshow(Image.open(img))
-        plt.title(f"Top {i+1}")
+        plt.title(extract_clothing_id(img))
         plt.axis("off")
 
     plt.show()
