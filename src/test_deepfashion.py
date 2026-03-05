@@ -8,9 +8,9 @@ from tqdm import tqdm
 from model import ViBEModel
 
 
-# ---------------------------
+# -----------------------------
 # PATHS
-# ---------------------------
+# -----------------------------
 
 QUERY_DIR = "/content/drive/MyDrive/SmartWardrobe/deepfashion_test_subset/queries"
 GALLERY_DIR = "/content/drive/MyDrive/SmartWardrobe/deepfashion_test_subset/gallery"
@@ -18,17 +18,17 @@ GALLERY_DIR = "/content/drive/MyDrive/SmartWardrobe/deepfashion_test_subset/gall
 MODEL_PATH = "/content/drive/MyDrive/SmartWardrobe/best_vibe_model.pth"
 
 
-# ---------------------------
+# -----------------------------
 # DEVICE
-# ---------------------------
+# -----------------------------
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
 
-# ---------------------------
+# -----------------------------
 # TRANSFORM
-# ---------------------------
+# -----------------------------
 
 transform = transforms.Compose([
     transforms.Resize((224,224)),
@@ -36,9 +36,9 @@ transform = transforms.Compose([
 ])
 
 
-# ---------------------------
+# -----------------------------
 # MODEL
-# ---------------------------
+# -----------------------------
 
 model = ViBEModel(
     body_input_dim=7,
@@ -49,9 +49,9 @@ model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
 model.eval()
 
 
-# ---------------------------
+# -----------------------------
 # ENCODER
-# ---------------------------
+# -----------------------------
 
 def encode_image(path):
 
@@ -62,33 +62,33 @@ def encode_image(path):
         emb = model.encode_cloth(img)
 
     emb = emb.cpu().numpy()[0]
-    emb /= np.linalg.norm(emb)
+
+    # normalize embedding
+    emb = emb / np.linalg.norm(emb)
 
     return emb
 
 
-# ---------------------------
+# -----------------------------
 # EXTRACT CLOTHING ID
-# ---------------------------
+# -----------------------------
 
 def extract_clothing_id(path):
 
-    parts = path.parts
-
-    for p in parts:
-        if p.startswith("id_"):
-            return p
+    for part in path.parts:
+        if part.startswith("id_"):
+            return part
 
     return None
 
 
-# ---------------------------
+# -----------------------------
 # LOAD GALLERY
-# ---------------------------
+# -----------------------------
 
 print("\nComputing gallery embeddings...")
 
-gallery_paths = list(Path(GALLERY_DIR).glob("*.jpg"))
+gallery_paths = sorted(list(Path(GALLERY_DIR).glob("*.jpg")))
 
 gallery_embeddings = []
 gallery_ids = []
@@ -103,13 +103,13 @@ for p in tqdm(gallery_paths):
 gallery_embeddings = np.array(gallery_embeddings)
 
 
-# ---------------------------
-# EVALUATE
-# ---------------------------
+# -----------------------------
+# EVALUATION
+# -----------------------------
 
 print("\nRunning retrieval evaluation...")
 
-query_paths = list(Path(QUERY_DIR).glob("*.jpg"))
+query_paths = sorted(list(Path(QUERY_DIR).glob("*.jpg")))
 
 recall1 = 0
 recall5 = 0
@@ -120,9 +120,12 @@ for q in tqdm(query_paths):
 
     q_emb = encode_image(q)
 
-    scores = np.dot(gallery_embeddings, q_emb)
+    scores = gallery_embeddings @ q_emb
 
     idx = np.argsort(-scores)
+
+    # remove self-match
+    idx = [i for i in idx if gallery_paths[i].name != q.name]
 
     retrieved_ids = [gallery_ids[i] for i in idx]
 
