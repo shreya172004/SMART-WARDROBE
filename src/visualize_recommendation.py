@@ -95,7 +95,7 @@ for i in range(5):
 
     row = df.iloc[i]
 
-    body_vec = row.values[1:]
+    body_vec = row.values[1:].astype(np.float32)
     gt_image_name = row["image"]
 
     body_emb = encode_body(body_vec)
