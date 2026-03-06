@@ -23,7 +23,7 @@ Body Measurements (7D)
 Clothing Image (3×224×224)                        │   (Euclidean Distance)
     └─► ClothEncoder (ResNet50 → 512 → 256 → 128)┘
 ```
-# Features
+## ✨Features
 
 - Body measurement extraction via MediaPipe pose estimation directly from images.
 - Bidirectional recommendation: given a body → find best clothing; given clothing → find best body type.
@@ -31,5 +31,6 @@ Clothing Image (3×224×224)                        │   (Euclidean Distance)
 - Resume training support from checkpoints.
 - Visualization of top-5 recommendations with similarity scores.
 
-# Contributing
+## 🤝Contributing
 Pull requests and suggestions are welcome! Feel free to open an issue for bugs or feature requests.
+
