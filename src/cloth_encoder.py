@@ -46,7 +46,7 @@ class ClothEncoder(nn.Module):
 
         # ================= FREEZE OPTION =================
         if freeze:
-            for param in self.parameters():
+            for param in self.backbone.parameters():
                 param.requires_grad = False
 
     def forward(self, x):
@@ -58,6 +58,10 @@ class ClothEncoder(nn.Module):
         embedding = F.normalize(embedding, dim=1)
 
         return embedding
+    
+    def unfreeze_backbone(self):
+    for param in self.backbone.parameters():
+        param.requires_grad = True
 
 
     # ================= INFERENCE UTILITIES =================
