@@ -1,4 +1,6 @@
-data/
-checkpoints/
 __pycache__/
-*.pyc
+*.pth
+*.pt
+*.ckpt
+data/
+deepfashion_subset/
