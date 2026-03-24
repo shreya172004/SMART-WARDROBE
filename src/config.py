@@ -20,7 +20,7 @@ LR = 1e-4
 EPOCHS = 10
 
 # Contrastive learning
-TEMPERATURE = 0.07
+TEMPERATURE = 0.03
 
 # Pretraining
 PRETRAIN_EPOCHS = 3
