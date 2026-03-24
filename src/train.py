@@ -8,31 +8,22 @@ import config
 from dataset import BodyClothDataset
 from model import ViBEModel
 
-# ================= FINAL LOSS (100% REVIEWER-APPROVED) =================
+# ================= FINAL LOSS  =================
 def final_loss(body_emb, cloth_emb, body_vec_raw, temperature=0.07):
-    # similarity matrix
     sim_matrix = torch.matmul(body_emb, cloth_emb.T) / temperature
     labels = torch.arange(sim_matrix.size(0)).to(sim_matrix.device)
 
-    # normalized body similarity for debiasing
     body_norm = F.normalize(body_vec_raw, dim=1)
     body_sim = torch.matmul(body_norm, body_norm.T)
-
     debias = 1 - body_sim.clamp(0, 0.9)
 
-    # hardness weighting
-    hardness = torch.softmax(sim_matrix, dim=1)
+    # Softer hardness (more stable)
+    hardness = torch.exp(-sim_matrix)        # ← changed back to exp 
 
-    # compute per-sample losses
-    loss1 = F.cross_entropy(sim_matrix, labels, reduction='none')
-    loss2 = F.cross_entropy(sim_matrix.T, labels, reduction='none')
+    sim_matrix = sim_matrix * debias * hardness
 
-    #  FINAL COMBINED WEIGHT (debiasing + hardness)
-    weights = (debias * hardness).mean(dim=1)
-
-    loss1 = (loss1 * weights).mean()
-    loss2 = (loss2 * weights).mean()
-
+    loss1 = F.cross_entropy(sim_matrix, labels)
+    loss2 = F.cross_entropy(sim_matrix.T, labels)
     return (loss1 + loss2) / 2
 
 
