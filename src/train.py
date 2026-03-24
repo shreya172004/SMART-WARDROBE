@@ -9,23 +9,40 @@ from dataset import BodyClothDataset
 from model import ViBEModel
 
 # ================= FINAL LOSS  =================
-def final_loss(body_emb, cloth_emb, body_vec_raw, temperature=0.07):
-    sim_matrix = torch.matmul(body_emb, cloth_emb.T) / temperature
-    labels = torch.arange(sim_matrix.size(0)).to(sim_matrix.device)
+def final_loss(body_emb, cloth_emb, body_vec_raw, temperature=0.03):
 
+    # similarity
+    sim = torch.matmul(body_emb, cloth_emb.T) / temperature
+
+    labels = torch.arange(sim.size(0)).to(sim.device)
+
+    # -----------------------------
+    # BODY DEBIASING 
+    # -----------------------------
     body_norm = F.normalize(body_vec_raw, dim=1)
     body_sim = torch.matmul(body_norm, body_norm.T)
-    debias = 1 - body_sim.clamp(0, 0.9)
 
-    # Softer hardness (more stable)
-    hardness = torch.exp(-sim_matrix)        # ← changed back to exp 
+    debias = 1 - body_sim
+    debias.fill_diagonal_(1.0)
 
-    sim_matrix = sim_matrix * debias * hardness
+    sim = sim * debias
 
-    loss1 = F.cross_entropy(sim_matrix, labels)
-    loss2 = F.cross_entropy(sim_matrix.T, labels)
+    # -----------------------------
+    # HARD NEGATIVE MINING 
+    # -----------------------------
+    with torch.no_grad():
+        mask = 1 - torch.eye(sim.size(0)).to(sim.device)
+        hardness = torch.softmax(sim * mask, dim=1)
+
+    sim = sim * (1 + hardness)
+
+    # -----------------------------
+    # LOSS
+    # -----------------------------
+    loss1 = F.cross_entropy(sim, labels)
+    loss2 = F.cross_entropy(sim.T, labels)
+
     return (loss1 + loss2) / 2
-
 
 # ================= TRAIN FUNCTION =================
 def train(epochs=10,
