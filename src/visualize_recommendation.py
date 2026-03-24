@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from model import ViBEModel
+import random
 
 # PATHS
 MODEL_PATH = "/content/drive/MyDrive/SmartWardrobe/best_vibe_model.pth"
