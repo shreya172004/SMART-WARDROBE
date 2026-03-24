@@ -150,7 +150,7 @@ for _,row in tqdm(df.iterrows(), total=len(df)):
     gallery_emb = cloth_embeddings[gallery_idx]
     gallery_names = [cloth_images[i] for i in gallery_idx]
 
-    scores = gallery_emb @ body_emb
+    scores = np.dot(gallery_emb, body_emb)
 
     idx = np.argsort(-scores)
 

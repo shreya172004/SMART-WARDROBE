@@ -40,7 +40,10 @@ def extract_embedding(img_path):
     with torch.no_grad():
         emb = model.encode_cloth(img)
 
-    return emb.cpu().numpy()[0]
+    emb = emb.cpu().numpy()[0]
+    emb = emb / np.linalg.norm(emb)
+
+    return emb
 
 
 def extract_clothing_id(path):
@@ -88,9 +91,8 @@ for q in tqdm(query_paths):
 
     q_id = extract_clothing_id(q)
 
-    dists = np.linalg.norm(gallery_embeddings - q_emb, axis=1)
-
-    idx = np.argsort(dists)
+    scores = np.dot(gallery_embeddings, q_emb)
+    idx = np.argsort(-scores)
 
     ranked_ids = [gallery_ids[i] for i in idx]
 
