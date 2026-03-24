@@ -54,7 +54,7 @@ class ClothEncoder(nn.Module):
         features = self.backbone(x)
         embedding = self.projector(features)
 
-        # 🔥 CRITICAL
+        #  CRITICAL
         embedding = F.normalize(embedding, dim=1)
 
         return embedding
