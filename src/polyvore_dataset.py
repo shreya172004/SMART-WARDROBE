@@ -1,52 +1,17 @@
-
 """
 polyvore_dataset.py  —  Polyvore HuggingFace Arrow format loader
- 
-DATASET SCHEMA  (Marqo/polyvore, 94,100 rows, 6 Arrow shards)
-──────────────────────────────────────────────────────────────
-  Column    Type    Example
-  ────────  ──────  ────────────────────────────────────────
-  image     Image   PIL Image object (already decoded by HF)
-  category  str     "Day Dresses" | "Boots" | "Handbags" ...
-  text      str     "tibi knit long sleeve dress"
-  item_ID   str     "100002074_1"
-                     ─────────── ─
-                     set_id      item_index_within_outfit
- 
-OUTFIT GROUPING LOGIC
-─────────────────────
-  item_ID = "{set_id}_{item_index}"
-  All rows sharing the same set_id belong to one outfit → compatible.
-  e.g. "100002074_1", "100002074_2", "100002074_3" are all from
-  outfit 100002074 and are treated as positive (compatible) pairs.
- 
-LOADING
-───────
-  Uses datasets.load_from_disk(POLYVORE_ARROW_DIR) which reads
-  dataset_info.json + state.json + all .arrow shards automatically.
-  The "data" folder is passed directly — NOT the parent folder.
- 
-CLOTHING CATEGORIES USED FOR COMPATIBILITY
-───────────────────────────────────────────
-  We filter to fashion-only categories (exclude Food, Toys, Furniture
-  etc.) so the encoder learns garment compatibility, not random object
-  similarity. See FASHION_CATEGORIES below.
 """
- 
+
 import random
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
 from PIL import Image
 from collections import defaultdict
- 
+
 import config
- 
- 
-# ── Fashion-only categories to keep ────────────────────────────────
-# Derived from the actual category values in Marqo/polyvore.
-# Non-fashion items (Food, Toys, Furniture, etc.) are excluded so
-# the encoder learns garment compatibility, not random object proximity.
+
+
 FASHION_CATEGORIES = {
     "Day Dresses", "Boots", "Handbags", "Sunglasses", "Coats",
     "Blazers", "Skinny Jeans", "Watches", "Accessories",
@@ -66,86 +31,47 @@ FASHION_CATEGORIES = {
     "Crop Tops", "Button-Down Shirts", "Polo Shirts",
     "Graphic Tees", "Hoodies",
 }
- 
- 
+
+
 def _get_set_id(item_id: str) -> str:
-    """Extract set/outfit ID from item_ID.  '100002074_1' → '100002074'"""
     return item_id.rsplit("_", 1)[0]
- 
- 
-# ================================================================
-# MAIN DATASET CLASS
-# ================================================================
- 
+
+
 class PolyvoreArrowDataset(Dataset):
-    """
-    Loads the Polyvore dataset from HuggingFace Arrow shards.
- 
-    Each __getitem__ returns:
-        img        : (3, 224, 224) tensor
-        outfit_id  : int  — items sharing outfit_id are compatible
- 
-    This is designed for use with InfoNCELoss / supervised contrastive:
-    the loss treats same-outfit items as positives, cross-outfit as negatives.
- 
-    Usage:
-        dataset = PolyvoreArrowDataset(config.POLYVORE_ARROW_DIR)
-        loader  = DataLoader(dataset, batch_size=32, shuffle=True)
-        for imgs, outfit_ids in loader:
-            ...
-    """
- 
-    def __init__(self,
-                 arrow_dir: str = config.POLYVORE_ARROW_DIR,
-                 fashion_only: bool = True,
-                 max_samples: int = None):
-        """
-        arrow_dir     : path to the "data" folder containing
-                        dataset_info.json + .arrow shards
-        fashion_only  : if True, filter out non-clothing items
-        max_samples   : cap dataset size (useful for quick runs)
-        """
+
+    def __init__(self, arrow_dir=config.POLYVORE_ARROW_DIR,
+                 fashion_only=True, max_samples=None):
         from datasets import load_from_disk
- 
+
         print(f"  Loading Polyvore from: {arrow_dir}")
         hf_dataset = load_from_disk(arrow_dir)
         print(f"  Raw rows: {len(hf_dataset)}")
- 
-        # ── Filter to fashion categories ────────────────────────────
+
         if fashion_only:
             hf_dataset = hf_dataset.filter(
                 lambda row: row["category"] in FASHION_CATEGORIES,
                 desc="Filtering fashion items"
             )
             print(f"  After fashion filter: {len(hf_dataset)} rows")
- 
-        # ── Build outfit_id → integer mapping ───────────────────────
-        # item_ID = "{set_id}_{item_index}" → group by set_id
+
         set_ids     = [_get_set_id(row["item_ID"]) for row in hf_dataset]
         unique_sets = sorted(set(set_ids))
         self.set_id_to_int = {s: i for i, s in enumerate(unique_sets)}
- 
-        # ── Deterministic category -> int mapping ────────────────────
-        # Built once at init so all DataLoader workers get identical
-        # lookups via pickle — never use hash() which is randomised
-        # per process (PYTHONHASHSEED).
+
         all_cats        = sorted(set(row["category"] for row in hf_dataset))
         self.cat_to_int = {c: i for i, c in enumerate(all_cats)}
- 
-        # ── Store as list of (pil_image, outfit_id_int, cat_id_int) ──
+
         self.samples = []
         for i, row in enumerate(hf_dataset):
             outfit_int = self.set_id_to_int[_get_set_id(row["item_ID"])]
             cat_int    = self.cat_to_int[row["category"]]
             self.samples.append((row["image"], outfit_int, cat_int))
- 
+
         if max_samples:
             self.samples = self.samples[:max_samples]
- 
-        print(f"  Final dataset : {len(self.samples)} items, "
-              f"{len(unique_sets)} outfits")
- 
-        # ── Transform ───────────────────────────────────────────────
+
+        print(f"  Final dataset : {len(self.samples)} items, {len(unique_sets)} outfits")
+
         self.transform = transforms.Compose([
             transforms.Resize((256, 256)),
             transforms.CenterCrop(224),
@@ -156,149 +82,77 @@ class PolyvoreArrowDataset(Dataset):
             transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                  std =[0.229, 0.224, 0.225])
         ])
- 
+
     def __len__(self):
         return len(self.samples)
- 
+
     def __getitem__(self, idx):
-        pil_img, outfit_id, cat_id = self.samples[idx]   # unpack 3
- 
-        # HuggingFace Image column returns a PIL Image directly
+        pil_img, outfit_id, cat_id = self.samples[idx]   # 3 values
         if not isinstance(pil_img, Image.Image):
             pil_img = Image.fromarray(pil_img)
-        pil_img = pil_img.convert("RGB")
- 
-        return self.transform(pil_img), outfit_id, cat_id  # return 3
- 
- 
-# ================================================================
-# TRIPLET DATASET  (alternative — returns anchor/pos/neg explicitly)
-# ================================================================
- 
+        return self.transform(pil_img.convert("RGB")), outfit_id, cat_id  # 3 values
+
+
 class PolyvoreTripletDataset(Dataset):
-    """
-    Returns (anchor, positive, negative) image triplets.
- 
-    anchor   + positive : same outfit (compatible)
-    negative            : different outfit
- 
-    Use this if you prefer explicit triplet training over
-    in-batch negatives (InfoNCE). For most cases PolyvoreArrowDataset
-    + InfoNCELoss is more efficient with large batch sizes.
-    """
- 
-    def __init__(self,
-                 arrow_dir: str = config.POLYVORE_ARROW_DIR,
-                 fashion_only: bool = True):
+
+    def __init__(self, arrow_dir=config.POLYVORE_ARROW_DIR, fashion_only=True):
         from datasets import load_from_disk
- 
-        print(f"  Loading Polyvore triplets from: {arrow_dir}")
         hf_dataset = load_from_disk(arrow_dir)
- 
         if fashion_only:
             hf_dataset = hf_dataset.filter(
                 lambda row: row["category"] in FASHION_CATEGORIES,
                 desc="Filtering fashion items"
             )
- 
-        # Group by outfit (set_id)
         outfit_to_items = defaultdict(list)
         for row in hf_dataset:
-            set_id = _get_set_id(row["item_ID"])
-            outfit_to_items[set_id].append(row["image"])
- 
-        # Keep only outfits with >= 2 items (need at least anchor + positive)
-        self.outfits = {k: v for k, v in outfit_to_items.items()
-                        if len(v) >= 2}
+            outfit_to_items[_get_set_id(row["item_ID"])].append(row["image"])
+        self.outfits     = {k: v for k, v in outfit_to_items.items() if len(v) >= 2}
         self.outfit_keys = list(self.outfits.keys())
- 
-        # Flat item list for negative sampling
-        self.all_images = [img for imgs in self.outfits.values()
-                           for img in imgs]
- 
-        print(f"  Triplet dataset: {len(self.outfit_keys)} outfits, "
-              f"{len(self.all_images)} total items")
- 
-        self.transform = transforms.Compose([
-            transforms.Resize((256, 256)),
-            transforms.CenterCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std =[0.229, 0.224, 0.225])
+        self.all_images  = [img for imgs in self.outfits.values() for img in imgs]
+        self.transform   = transforms.Compose([
+            transforms.Resize((256, 256)), transforms.CenterCrop(224),
+            transforms.RandomHorizontalFlip(), transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
- 
+
     def _to_tensor(self, pil_img):
         if not isinstance(pil_img, Image.Image):
             pil_img = Image.fromarray(pil_img)
         return self.transform(pil_img.convert("RGB"))
- 
+
     def __len__(self):
         return len(self.outfit_keys)
- 
+
     def __getitem__(self, idx):
-        key    = self.outfit_keys[idx]
-        items  = self.outfits[key]
-        anchor_img, pos_img = random.sample(items, 2)
- 
-        # Negative: from a different outfit
+        items = self.outfits[self.outfit_keys[idx]]
+        anchor_img, pos_img = random.sample(items, 2)   # PIL images, not tuples
         outfit_set = set(id(x) for x in items)
         while True:
             neg_img = random.choice(self.all_images)
             if id(neg_img) not in outfit_set:
                 break
- 
-        return {
-            "anchor":   self._to_tensor(anchor_img),
-            "positive": self._to_tensor(pos_img),
-            "negative": self._to_tensor(neg_img),
-        }
- 
- 
-# ================================================================
-# QUICK DIAGNOSTIC — run this in Colab to verify the data loads
-# ================================================================
- 
-def verify_polyvore(arrow_dir: str = config.POLYVORE_ARROW_DIR,
-                    n_samples: int = 5):
-    """
-    Call this in Colab before training to confirm:
-      1. Arrow shards load correctly
-      2. item_ID → set_id grouping works
-      3. Images decode without errors
-      4. outfit_id integers are assigned correctly
- 
-    Usage in Colab:
-        from polyvore_dataset import verify_polyvore
-        verify_polyvore()
-    """
+        return {"anchor": self._to_tensor(anchor_img),
+                "positive": self._to_tensor(pos_img),
+                "negative": self._to_tensor(neg_img)}
+
+
+def verify_polyvore(arrow_dir=config.POLYVORE_ARROW_DIR, n_samples=5):
     print("=" * 55)
     print("  Polyvore Arrow dataset verification")
     print("=" * 55)
- 
-    dataset = PolyvoreArrowDataset(arrow_dir, fashion_only=True,
-                                   max_samples=200)
- 
+    dataset = PolyvoreArrowDataset(arrow_dir, fashion_only=True, max_samples=200)
     print(f"\n  Dataset length  : {len(dataset)}")
     print(f"  Sample __getitem__:")
- 
     for i in range(min(n_samples, len(dataset))):
-        img_tensor, outfit_id, cat_id = dataset[i]   # 3 values
-        print(f"    [{i}] shape={img_tensor.shape}  "
-              f"dtype={img_tensor.dtype}  outfit={outfit_id}  cat_id={cat_id}")
- 
-    # Check that multiple items share outfit IDs (compatibility pairs exist)
-    outfit_ids = [dataset[i][1] for i in range(min(100, len(dataset)))]
+        img_tensor, outfit_id, cat_id = dataset[i]
+        print(f"    [{i}] shape={img_tensor.shape}  outfit={outfit_id}  cat_id={cat_id}")
     from collections import Counter
-    counts = Counter(outfit_ids)
+    counts = Counter(dataset[i][1] for i in range(min(100, len(dataset))))
     multi  = sum(1 for c in counts.values() if c > 1)
-    print(f"\n  Out of first 100 items: {multi} outfits have >1 item "
-          f"(positive pairs available)")
- 
-    print("\n  ✓ Polyvore dataset loads correctly!")
+    print(f"\n  Outfits with >1 item in first 100: {multi}  (positive pairs available)")
+    print("\n  Polyvore dataset loads correctly!")
     return dataset
- 
- 
+
+
 if __name__ == "__main__":
     verify_polyvore()
- 
