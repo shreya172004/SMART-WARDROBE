@@ -1,154 +1,254 @@
+"""
+train.py — Stage 3: Fashionista body-clothing alignment
+ 
+Runs AFTER pretrain_clothing_encoder.py stages 1 and 2.
+Loads Polyvore-pretrained clothing encoder and aligns it to body measurements.
+ 
+Key fixes vs v1:
+  1. Temperature fixed to 0.07 (was 0.03 → caused loss collapse)
+  2. DeboasedInfoNCELoss replaces final_loss() — mask-based debiasing,
+     no gradient scaling instability
+  3. unfreeze_layer4_only() replaces full unfreeze — stops overfitting
+  4. Early stopping with patience=3 — stops at the real best epoch
+  5. Collapse check after every val epoch
+  6. Upper-body crop in dataset — fixes the heels recommendation issue
+  7. Cosine LR scheduler replaces flat LR
+"""
+ 
 import os
 import torch
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-
+ 
 import config
 from dataset import BodyClothDataset
 from model import ViBEModel
-
-# ================= FINAL LOSS  =================
-def final_loss(body_emb, cloth_emb, body_vec_raw, temperature=0.03):
-
-    # similarity
-    sim = torch.matmul(body_emb, cloth_emb.T) / temperature
-
-    labels = torch.arange(sim.size(0)).to(sim.device)
-
-    # -----------------------------
-    # BODY DEBIASING 
-    # -----------------------------
-    body_norm = F.normalize(body_vec_raw, dim=1)
-    body_sim = torch.matmul(body_norm, body_norm.T)
-
-    debias = 1 - body_sim
-    debias.fill_diagonal_(1.0)
-
-    sim = sim * debias
-
-    # -----------------------------
-    # HARD NEGATIVE MINING 
-    # -----------------------------
-    with torch.no_grad():
-        mask = 1 - torch.eye(sim.size(0)).to(sim.device)
-        hardness = torch.softmax(sim * mask, dim=1)
-
-    sim = sim * (1 + hardness)
-
-    # -----------------------------
-    # LOSS
-    # -----------------------------
-    loss1 = F.cross_entropy(sim, labels)
-    loss2 = F.cross_entropy(sim.T, labels)
-
-    return (loss1 + loss2) / 2
-
-# ================= TRAIN FUNCTION =================
-def train(epochs=10,
-          save_path="/content/drive/MyDrive/SmartWardrobe/best_vibe_model.pth",
-          pretrained_cloth_path="/content/drive/MyDrive/SmartWardrobe/clothing_encoder.pth"):
-
+from loss import DeboasedInfoNCELoss, check_embedding_collapse
+ 
+ 
+# ================================================================
+# HELPERS
+# ================================================================
+ 
+class EarlyStopping:
+    """Stops training when val loss stops improving."""
+ 
+    def __init__(self, patience: int = 3, save_path: str = "best_model.pth"):
+        self.patience   = patience
+        self.save_path  = save_path
+        self.best_loss  = float("inf")
+        self.counter    = 0
+        self.best_epoch = 0
+ 
+    def step(self, val_loss: float, model, epoch: int) -> bool:
+        """Returns True if training should stop."""
+        if val_loss < self.best_loss:
+            self.best_loss  = val_loss
+            self.counter    = 0
+            self.best_epoch = epoch
+            torch.save(model.state_dict(), self.save_path)
+            print(f"  ✓ Best model saved (epoch {epoch+1}, val={val_loss:.4f})")
+        else:
+            self.counter += 1
+            print(f"  No improvement ({self.counter}/{self.patience})")
+            if self.counter >= self.patience:
+                print(f"\n  Early stopping at epoch {epoch+1}. "
+                      f"Best was epoch {self.best_epoch+1}.")
+                return True
+        return False
+ 
+ 
+# ================================================================
+# MAIN TRAINING FUNCTION
+# ================================================================
+ 
+def train(
+    epochs:              int   = config.EPOCHS,
+    save_path:           str   = config.BEST_MODEL_PATH,
+    polyvore_ckpt:       str   = config.POLYVORE_ENCODER_PATH,
+    deepfashion_ckpt:    str   = config.DEEPFASHION_ENCODER_PATH,
+):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # Datasets
-    train_dataset = BodyClothDataset(image_dir=config.TRAIN_DIR, body_csv=config.BODY_VECTOR_CSV)
-    val_dataset   = BodyClothDataset(image_dir=config.VAL_DIR,   body_csv=config.BODY_VECTOR_CSV)
-
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=config.BATCH_SIZE,
-                                               shuffle=True, num_workers=2, pin_memory=True)
-    val_loader   = torch.utils.data.DataLoader(val_dataset,   batch_size=config.BATCH_SIZE,
-                                               shuffle=False, num_workers=2, pin_memory=True)
-
-    # Model + DeepFashion pretrained clothing encoder
-    model = ViBEModel().to(device)
-    if os.path.exists(pretrained_cloth_path):
-        print(f" Loading DeepFashion-pretrained clothing encoder")
+    print(f"\nUsing device: {device}")
+ 
+    # ── Datasets ────────────────────────────────────────────────────
+    train_dataset = BodyClothDataset(
+        image_dir=config.TRAIN_DIR,
+        body_csv=config.BODY_VECTOR_CSV,
+        use_upper_crop=True,    # KEY FIX: reduces pose/shoe bias
+        augment=True,
+        body_completeness_threshold=0.7
+    )
+    val_dataset = BodyClothDataset(
+        image_dir=config.VAL_DIR,
+        body_csv=config.BODY_VECTOR_CSV,
+        use_upper_crop=True,
+        augment=False,
+        body_completeness_threshold=0.7
+    )
+ 
+    train_loader = DataLoader(train_dataset,
+                               batch_size=config.BATCH_SIZE,
+                               shuffle=True, num_workers=2, pin_memory=True)
+    val_loader   = DataLoader(val_dataset,
+                               batch_size=config.BATCH_SIZE,
+                               shuffle=False, num_workers=2, pin_memory=True)
+ 
+    # ── Model ────────────────────────────────────────────────────────
+    model = ViBEModel(
+        body_input_dim=config.BODY_INPUT_DIM,
+        embedding_dim=config.EMBEDDING_DIM
+    ).to(device)
+ 
+    # Load the best available pretrained clothing encoder:
+    # Polyvore (compatibility-aware) > DeepFashion (visual only) > ImageNet
+    if os.path.exists(polyvore_ckpt):
+        print(f"  Loading Polyvore-pretrained clothing encoder")
         model.cloth_encoder.load_state_dict(
-            torch.load(pretrained_cloth_path, map_location=device), strict=False)
+            torch.load(polyvore_ckpt, map_location=device), strict=False)
+    elif os.path.exists(deepfashion_ckpt):
+        print(f"  Loading DeepFashion-pretrained clothing encoder")
+        model.cloth_encoder.load_state_dict(
+            torch.load(deepfashion_ckpt, map_location=device), strict=False)
     else:
-        print(" No pretrained encoder found")
-
-    # Freeze backbone initially
-    for param in model.cloth_encoder.backbone.parameters():
-        param.requires_grad = False
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-
-    best_val_loss = float("inf")
+        print("  WARNING: No pretrained encoder found — using ImageNet weights only")
+ 
+    # ── Phase 1: freeze backbone, train body encoder + projector ─────
+    model.cloth_encoder.freeze_backbone()
+    print(f"  Phase 1: backbone frozen")
+ 
+    # ── Loss & optimizer ─────────────────────────────────────────────
+    loss_fn = DeboasedInfoNCELoss(
+        init_temperature=config.TEMPERATURE,   # 0.07
+        fn_threshold=0.85,
+        hard_neg_weight=0.3
+    ).to(device)
+ 
+    # Separate LRs: body encoder + loss params get higher LR
+    backbone_params   = list(model.cloth_encoder.backbone.parameters())
+    non_backbone_params = (
+        [p for p in model.body_encoder.parameters()]
+        + list(model.cloth_encoder.projector.parameters())
+        + list(loss_fn.parameters())
+    )
+ 
+    optimizer = torch.optim.AdamW([
+        {"params": non_backbone_params, "lr": config.LR},
+        {"params": backbone_params,     "lr": config.LR * 0.01},  # tiny initially
+    ], weight_decay=1e-4)
+ 
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs
+    )
+ 
+    stopper = EarlyStopping(patience=config.EARLY_STOP_PATIENCE,
+                            save_path=save_path)
+ 
     train_losses, val_losses = [], []
-
+    phase2_started = False
+ 
+    # ── Training loop ────────────────────────────────────────────────
     for epoch in range(epochs):
-        # Unfreeze at epoch 3
-        if epoch == 3:
-            print("\n Unfreezing ResNet backbone + lowering LR...\n")
-            for param in model.cloth_encoder.backbone.parameters():
-                param.requires_grad = True
-            optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
-
-        # ================= TRAIN =================
+ 
+        # Phase 2: unfreeze layer4 at epoch 3
+        if epoch == 3 and not phase2_started:
+            model.cloth_encoder.unfreeze_layer4_only()
+            # Boost backbone LR to allow layer4 to adapt
+            for g in optimizer.param_groups:
+                if g["params"][0] in backbone_params:
+                    g["lr"] = config.LR * 0.1
+            print(f"\n  Phase 2: layer4 unfrozen (epoch {epoch+1})\n")
+            phase2_started = True
+ 
+        # ── Train ──────────────────────────────────────────────────
         model.train()
+        loss_fn.train()
         train_loss = 0.0
-        loop = tqdm(train_loader, desc=f"Train Epoch {epoch+1}/{epochs}")
-
+ 
+        loop = tqdm(train_loader, desc=f"Train Ep {epoch+1}/{epochs}")
         for batch in loop:
-            body_vec = batch["body"].to(device)
+            body_vec  = batch["body"].to(device)
             cloth_img = batch["image"].to(device)
-
+ 
             body_emb, cloth_emb = model(body_vec, cloth_img)
-
-            loss = final_loss(body_emb, cloth_emb, body_vec)
-
+            loss, temp = loss_fn(body_emb, cloth_emb, body_vec)
+ 
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-
+ 
             train_loss += loss.item()
-            loop.set_postfix(loss=f"{loss.item():.4f}")
-
+            loop.set_postfix(loss=f"{loss.item():.4f}", temp=f"{temp:.3f}")
+ 
         avg_train = train_loss / len(train_loader)
         train_losses.append(avg_train)
-
-        # ================= VALIDATION =================
+ 
+        # ── Validate ───────────────────────────────────────────────
         model.eval()
+        loss_fn.eval()
         val_loss = 0.0
+        all_body_embs  = []
+        all_cloth_embs = []
+ 
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f"Val Epoch {epoch+1}/{epochs}"):
-                body_vec = batch["body"].to(device)
+            for batch in tqdm(val_loader, desc=f"Val   Ep {epoch+1}/{epochs}"):
+                body_vec  = batch["body"].to(device)
                 cloth_img = batch["image"].to(device)
+ 
                 body_emb, cloth_emb = model(body_vec, cloth_img)
-                loss = final_loss(body_emb, cloth_emb, body_vec, temperature=config.TEMPERATURE)
+                loss, _  = loss_fn(body_emb, cloth_emb, body_vec)
                 val_loss += loss.item()
-
+ 
+                all_body_embs.append(body_emb.cpu())
+                all_cloth_embs.append(cloth_emb.cpu())
+ 
         avg_val = val_loss / len(val_loader)
         val_losses.append(avg_val)
-
-        print(f"\nEpoch {epoch+1}/{epochs} | Train Loss: {avg_train:.4f} | Val Loss: {avg_val:.4f}")
-
-        if avg_val < best_val_loss:
-            best_val_loss = avg_val
-            torch.save(model.state_dict(), save_path)
-            print(" Best model saved!")
-
-    # Final plots
-    plt.figure(figsize=(12, 5))
+ 
+        print(f"\nEpoch {epoch+1}/{epochs} | "
+              f"Train: {avg_train:.4f} | Val: {avg_val:.4f} | "
+              f"Temp: {loss_fn.temperature.item():.4f}")
+ 
+        # Collapse check every epoch
+        check_embedding_collapse(
+            torch.cat(all_body_embs,  dim=0),
+            torch.cat(all_cloth_embs, dim=0)
+        )
+ 
+        scheduler.step()
+ 
+        if stopper.step(avg_val, model, epoch):
+            break   # early stopping
+ 
+    # ── Plots ────────────────────────────────────────────────────────
+    plt.figure(figsize=(12, 4))
     plt.subplot(1, 2, 1)
     plt.plot(train_losses, label="Train")
-    plt.plot(val_losses, label="Val")
-    plt.title("Loss Curves")
+    plt.plot(val_losses,   label="Val")
+    plt.axvline(stopper.best_epoch, color="green", linestyle="--",
+                label=f"Best (ep {stopper.best_epoch+1})")
+    plt.title("Loss curves")
     plt.legend()
+ 
     plt.subplot(1, 2, 2)
     plt.plot(train_losses, label="Train")
-    plt.plot(val_losses, label="Val")
+    plt.plot(val_losses,   label="Val")
     plt.yscale("log")
-    plt.title("Loss Curves (Log Scale)")
+    plt.title("Loss curves (log scale)")
     plt.legend()
+ 
+    plt.tight_layout()
+    plt.savefig("/content/drive/MyDrive/SmartWardrobe/loss_curves.png", dpi=120)
     plt.show()
-
-    print(" Training completed successfully!")
-
-
+ 
+    print(f"\n✓ Training complete. Best epoch: {stopper.best_epoch+1}, "
+          f"best val loss: {stopper.best_loss:.4f}")
+ 
+ 
 if __name__ == "__main__":
     train()
+ 
+
