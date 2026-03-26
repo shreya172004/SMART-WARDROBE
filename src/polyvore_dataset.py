@@ -239,9 +239,8 @@ def verify_polyvore(arrow_dir: str = config.POLYVORE_ARROW_DIR,
     print(f"  Sample __getitem__:")
  
     for i in range(min(n_samples, len(dataset))):
-        img_tensor, outfit_id = dataset[i]
-        print(f"    [{i}] tensor shape={img_tensor.shape}  "
-              f"dtype={img_tensor.dtype}  outfit_id={outfit_id}")
+        img_tensor, outfit_id, category = dataset[i]
+        print(f"    [{i}] shape={img_tensor.shape}  outfit={outfit_id}  category={category}")
  
     # Check that multiple items share outfit IDs (compatibility pairs exist)
     outfit_ids = [dataset[i][1] for i in range(min(100, len(dataset)))]
