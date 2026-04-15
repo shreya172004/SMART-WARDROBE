@@ -44,8 +44,13 @@ class BodyEncoder(nn.Module):
  
     def normalize_input(self, x):
         mean = x.mean(dim=0, keepdim=True)
-        std  = x.std(dim=0, keepdim=True)
-        return (x - mean) / (std + self.eps)
+        # correction=0 uses population std (safe for batch size 1).
+        # clamp min=1e-4 prevents division by zero when all samples
+        # in the batch have the same value for a feature (std=0).
+        # This was producing the UserWarning: std() degrees of freedom <= 0
+        # and caused NaN when followed by Linear layers.
+        std  = x.std(dim=0, keepdim=True, correction=0).clamp(min=1e-4)
+        return (x - mean) / std
  
     def forward(self, x):
         x         = self.normalize_input(x)
@@ -137,4 +142,3 @@ if __name__ == "__main__":
     print(f"Input shape  : {dummy.shape}")
     print(f"Output shape : {output.shape}")
     print(f"L2 norms     : {output.norm(dim=1).tolist()}")
- 
