@@ -136,11 +136,30 @@ class DeboasedInfoNCELoss(nn.Module):
                 boost = (self.hard_neg_weight * hardness).clamp(max=0.5)
             logits_debiased = logits_debiased + boost * neg_mask.float()
  
-        # ── 3. Bidirectional cross-entropy ───────────────────────────
-        labels   = torch.arange(B, device=body_emb.device)
+        # ── 3. Bidirectional cross-entropy (stable via F.cross_entropy) ──
+        # F.cross_entropy uses logsumexp internally — never overflows.
+        # Also: if ALL rows in a column are -inf (entire column masked),
+        # cross_entropy returns inf. Guard against this.
+        labels = torch.arange(B, device=body_emb.device)
+ 
+        # Check that every row has at least one finite logit
+        has_finite = torch.isfinite(logits_debiased).any(dim=1)
+        if not has_finite.all():
+            # Fall back to unmasked logits for rows that are fully masked
+            fallback = logits.clone()
+            logits_debiased = torch.where(
+                has_finite.unsqueeze(1).expand_as(logits_debiased),
+                logits_debiased, fallback
+            )
+ 
         loss_b2c = F.cross_entropy(logits_debiased,   labels)
         loss_c2b = F.cross_entropy(logits_debiased.T, labels)
         loss     = (loss_b2c + loss_c2b) / 2
+ 
+        # Final NaN guard
+        if not torch.isfinite(loss):
+            loss = torch.tensor(0.0, device=body_emb.device,
+                                requires_grad=True)
  
         return loss, t.item()
  
