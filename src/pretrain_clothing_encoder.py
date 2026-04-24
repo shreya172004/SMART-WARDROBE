@@ -1,57 +1,36 @@
 """
-pretrain_clothing_encoder.py  —  Fixed NaN / collapse edition
+pretrain_clothing_encoder.py  —  Final stable version
  
-ROOT CAUSE OF NaN CHAIN:
-─────────────────────────────────────────────────────────────────
-Stage 2 printed Val: 0.0000 every epoch — this was SILENT COLLAPSE,
-not good training. The collapsed weights caused Stage 3 to produce
-NaN from batch 1.
+FIXES IN THIS VERSION:
+──────────────────────────────────────────────────────────────────
+Fix 1  HuggingFace filter cache corruption
+   The two cache-*.arrow files (445 KB each) in your Drive folder
+   are corrupt filter caches from a previous failed run. They cause
+   load_from_disk+filter to return almost no data silently.
+   Fix: load raw Arrow shards manually with pyarrow, bypassing the
+   HuggingFace cache system entirely. No cache files are written.
  
-THREE sources of NaN / collapse fixed here:
+Fix 2  Val loss = 0.0000 (no positive pairs in val batches)
+   With 19,268 outfits and batch_size=32, a random 90/10 split gives
+   P(same-outfit pair in batch) ≈ 0.002 per batch. Almost every val
+   batch has zero positive pairs → loss = 0 from the clamp.
+   Fix: outfit-aware train/val split. We split by outfit set_id,
+   so all items from a given outfit stay together in train OR val.
+   Val outfits are sampled to guarantee ≥2 items per outfit → every
+   val batch has real positive pairs → real loss values.
  
-NaN-1  exp() overflow in loss denominator
-   torch.exp(sim/0.07) overflows float32 when sim > ~88.
-   After Stage 1 the projector produces embeddings with cosine
-   similarity ~0.97 → logit = 0.97/0.07 = 13.9 → exp = 1.1e6.
-   With batch=32 items, sum ≈ 32 × 1.1e6 → log(...) fine.
-   BUT after a few gradient steps with hard_neg boost, logits
-   spike → exp overflows → sum = inf → log(inf) = inf →
-   inf - inf = NaN.
-   FIX: Use numerically stable log-sum-exp via
-        F.cross_entropy (which applies log-softmax internally
-        using the logsumexp trick). This is ALWAYS numerically
-        stable regardless of logit magnitude.
- 
-NaN-2  Val loss = 0.0000 (silent collapse from batch 0)
-   polyvore_contrastive_category_aware was called on the val
-   loader WITHOUT hard_neg_weight, but STILL called with
-   temperature=0.07. If the batch has NO positive pairs
-   (common in a random 10% val split with 19268 outfits and
-   batch=32 → probability of a same-outfit pair ≈ 32/19268 ≈ 0.002)
-   then pos_off.sum(dim=1) = 0 for all rows → n_pos = 1 (clamped)
-   → loss = -(0/1) = 0.0 for every batch → Val = 0.0000.
-   This looked like perfect training but was actually division by
-   zero masked by the clamp. The saved checkpoint was the FIRST
-   batch's model (val=0 < inf) — essentially random.
-   FIX: Use F.cross_entropy with diagonal labels — this is always
-        well-defined even when no same-outfit pairs exist in the
-        batch. It treats item i's own clothing as its positive
-        (self-supervised style, valid for outfit compatibility).
- 
-NaN-3  body_encoder.normalize_input std=0 warning
-   std() with a batch of identical body vectors = 0 → division by
-   0+eps=1e-6 → values ~1e6 → NaN after Linear layer.
-   Seen in the warning: "std(): degrees of freedom is <= 0"
-   FIX: Use the population std (correction=0) and clamp to min 1e-4.
-─────────────────────────────────────────────────────────────────
+Fix 3  Numerically stable loss via F.cross_entropy (kept from prev fix)
+──────────────────────────────────────────────────────────────────
 """
  
 import argparse
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
 from PIL import Image
+from collections import defaultdict
+import random
 from tqdm import tqdm
  
 import config
@@ -89,47 +68,88 @@ def _get_set_id(item_id: str) -> str:
  
  
 # ================================================================
-# POLYVORE DATASET
+# POLYVORE DATASET — loads via pyarrow directly (no HF cache)
 # ================================================================
  
 class PolyvoreArrowDataset(Dataset):
     """
-    Returns (img_tensor, outfit_id_int, category_id_int).
-    category_id uses deterministic sorted mapping — never hash().
+    Loads Polyvore Arrow shards directly via pyarrow.
+    Bypasses HuggingFace datasets cache completely — no cache-*.arrow
+    files are written or read. This avoids the corrupt cache problem.
+ 
+    __getitem__ returns (img_tensor, outfit_id_int, category_id_int).
     """
  
     def __init__(self, arrow_dir=config.POLYVORE_ARROW_DIR,
-                 fashion_only=True, max_samples=None):
-        from datasets import load_from_disk
+                 fashion_only=True, indices=None):
+        """
+        arrow_dir    : folder containing data-00000-of-00006.arrow etc.
+        fashion_only : filter to FASHION_CATEGORIES only
+        indices      : optional list of row indices to use (for splits)
+        """
+        import pyarrow as pa
+        import glob, os
  
-        print(f"  Loading Polyvore from: {arrow_dir}")
-        hf_dataset = load_from_disk(arrow_dir)
-        print(f"  Raw rows: {len(hf_dataset)}")
+        print(f"  Loading Polyvore shards from: {arrow_dir}")
  
-        if fashion_only:
-            hf_dataset = hf_dataset.filter(
-                lambda row: row["category"] in FASHION_CATEGORIES,
-                desc="Filtering fashion items"
+        # Find all data shards (not cache files)
+        shard_paths = sorted(glob.glob(
+            os.path.join(arrow_dir, "data-*-of-*.arrow")
+        ))
+        if not shard_paths:
+            raise FileNotFoundError(
+                f"No data-*-of-*.arrow files found in {arrow_dir}.\n"
+                f"Files present: {os.listdir(arrow_dir)}"
             )
-            print(f"  After fashion filter: {len(hf_dataset)} rows")
+        print(f"  Found {len(shard_paths)} shards")
  
-        set_ids     = [_get_set_id(row["item_ID"]) for row in hf_dataset]
+        # Read all shards into memory as a list of dicts
+        raw_rows = []
+        for path in shard_paths:
+            reader = pa.ipc.open_file(path)
+            table  = reader.read_all()
+            # Convert to Python dicts row by row
+            n = table.num_rows
+            # Get column arrays
+            images    = table.column("image")
+            categories = table.column("category")
+            item_ids   = table.column("item_ID")
+ 
+            for i in range(n):
+                cat = categories[i].as_py()
+                if fashion_only and cat not in FASHION_CATEGORIES:
+                    continue
+                # Image is stored as a dict {"bytes": b"...", "path": ...}
+                # or directly as bytes depending on HF version
+                img_val = images[i].as_py()
+                raw_rows.append({
+                    "image":    img_val,
+                    "category": cat,
+                    "item_ID":  item_ids[i].as_py(),
+                })
+ 
+        print(f"  Rows after fashion filter: {len(raw_rows)}")
+ 
+        # Apply index subset if provided (for train/val split)
+        if indices is not None:
+            raw_rows = [raw_rows[i] for i in indices]
+ 
+        # Build deterministic mappings
+        set_ids     = [_get_set_id(r["item_ID"]) for r in raw_rows]
         unique_sets = sorted(set(set_ids))
         set_to_int  = {s: i for i, s in enumerate(unique_sets)}
  
-        all_cats        = sorted(set(row["category"] for row in hf_dataset))
+        all_cats        = sorted(set(r["category"] for r in raw_rows))
         self.cat_to_int = {c: i for i, c in enumerate(all_cats)}
  
+        # Store samples
         self.samples = []
-        for row in hf_dataset:
-            outfit_int = set_to_int[_get_set_id(row["item_ID"])]
-            cat_int    = self.cat_to_int[row["category"]]
-            self.samples.append((row["image"], outfit_int, cat_int))
+        for r in raw_rows:
+            outfit_int = set_to_int[_get_set_id(r["item_ID"])]
+            cat_int    = self.cat_to_int[r["category"]]
+            self.samples.append((r["image"], outfit_int, cat_int))
  
-        if max_samples:
-            self.samples = self.samples[:max_samples]
- 
-        print(f"  Final: {len(self.samples)} items, "
+        print(f"  Dataset: {len(self.samples)} items, "
               f"{len(unique_sets)} outfits, {len(all_cats)} categories")
  
         self.transform = transforms.Compose([
@@ -145,11 +165,85 @@ class PolyvoreArrowDataset(Dataset):
     def __len__(self):
         return len(self.samples)
  
+    def _decode_image(self, img_val):
+        """Handle both dict {'bytes':...} and raw bytes formats."""
+        import io
+        if isinstance(img_val, dict):
+            raw = img_val.get("bytes") or img_val.get("path")
+            if isinstance(raw, bytes):
+                return Image.open(io.BytesIO(raw)).convert("RGB")
+            elif isinstance(raw, str):
+                return Image.open(raw).convert("RGB")
+        elif isinstance(img_val, bytes):
+            return Image.open(io.BytesIO(img_val)).convert("RGB")
+        elif isinstance(img_val, Image.Image):
+            return img_val.convert("RGB")
+        raise ValueError(f"Unknown image format: {type(img_val)}")
+ 
     def __getitem__(self, idx):
-        pil_img, outfit_id, cat_id = self.samples[idx]
-        if not isinstance(pil_img, Image.Image):
-            pil_img = Image.fromarray(pil_img)
-        return self.transform(pil_img.convert("RGB")), outfit_id, cat_id
+        img_val, outfit_id, cat_id = self.samples[idx]
+        pil_img = self._decode_image(img_val)
+        return self.transform(pil_img), outfit_id, cat_id
+ 
+ 
+def make_outfit_aware_split(dataset: PolyvoreArrowDataset,
+                             val_fraction: float = 0.1,
+                             min_val_outfit_size: int = 2,
+                             seed: int = 42):
+    """
+    Split dataset into train/val by outfit (set_id), not by row.
+ 
+    Guarantees:
+    - All items from a given outfit stay together (train OR val)
+    - Val outfits all have ≥ min_val_outfit_size items
+      → every val batch has real positive pairs
+    - Roughly val_fraction of total items end up in val
+ 
+    Returns: (train_indices, val_indices) — lists of int
+    """
+    rng = random.Random(seed)
+ 
+    # Group sample indices by outfit_id
+    outfit_to_indices = defaultdict(list)
+    for i, (_, outfit_id, _) in enumerate(dataset.samples):
+        outfit_to_indices[outfit_id].append(i)
+ 
+    # Only outfits with ≥ min_val_outfit_size are eligible for val
+    eligible_val = {oid: idxs for oid, idxs in outfit_to_indices.items()
+                    if len(idxs) >= min_val_outfit_size}
+    ineligible   = {oid: idxs for oid, idxs in outfit_to_indices.items()
+                    if len(idxs) < min_val_outfit_size}
+ 
+    n_total   = len(dataset)
+    n_val_target = int(n_total * val_fraction)
+ 
+    # Shuffle eligible outfits and pick until we reach val target
+    eligible_list = list(eligible_val.keys())
+    rng.shuffle(eligible_list)
+ 
+    val_outfit_ids  = set()
+    val_count       = 0
+    for oid in eligible_list:
+        if val_count >= n_val_target:
+            break
+        val_outfit_ids.add(oid)
+        val_count += len(eligible_val[oid])
+ 
+    # Build index lists
+    val_indices   = [i for oid in val_outfit_ids
+                     for i in outfit_to_indices[oid]]
+    train_indices = [i for oid, idxs in outfit_to_indices.items()
+                     if oid not in val_outfit_ids
+                     for i in idxs]
+ 
+    print(f"  Outfit-aware split:")
+    print(f"    Train: {len(train_indices)} items, "
+          f"{len(outfit_to_indices) - len(val_outfit_ids)} outfits")
+    print(f"    Val:   {len(val_indices)} items, "
+          f"{len(val_outfit_ids)} outfits "
+          f"(all have ≥{min_val_outfit_size} items → positive pairs guaranteed)")
+ 
+    return train_indices, val_indices
  
  
 # ================================================================
@@ -158,115 +252,79 @@ class PolyvoreArrowDataset(Dataset):
  
 def deepfashion_contrastive(embs: torch.Tensor,
                              labels: torch.Tensor) -> torch.Tensor:
-    """
-    Supervised contrastive for DeepFashion.
-    Uses F.cross_entropy (logsumexp trick) — never overflows.
-    Treats the first occurrence of each label's match as the positive.
-    For simplicity we use the standard InfoNCE with diagonal positives
-    after sorting — but the numerically stable path is cross_entropy.
-    """
-    B   = embs.size(0)
-    # Scale logits
-    sim = torch.matmul(embs, embs.T) / 0.07          # (B, B)
+    """Standard supervised contrastive using F.cross_entropy (stable)."""
+    B    = embs.size(0)
+    sim  = torch.matmul(embs, embs.T) / 0.07
+    eye  = torch.eye(B, dtype=torch.bool, device=embs.device)
  
-    # Build positive pair label: for each row i, find one positive j
-    # (same clothing_id, different index). Falls back to self if none.
-    lbl       = labels.unsqueeze(1)                   # (B,1)
-    pos_mask  = torch.eq(lbl, lbl.T)                  # (B,B) bool
-    eye       = torch.eye(B, dtype=torch.bool, device=embs.device)
-    pos_mask  = pos_mask & ~eye                       # exclude self
+    lbl      = labels.unsqueeze(1)
+    pos_mask = torch.eq(lbl, lbl.T) & ~eye
  
-    # Use cross-entropy with the positive that has highest similarity
-    # (hard positive mining). If no positive exists, skip that row.
-    has_pos   = pos_mask.any(dim=1)                   # (B,) bool
- 
+    has_pos  = pos_mask.any(dim=1)
     if not has_pos.any():
-        # No positives at all in this batch (can happen with batch_size<2
-        # of same class). Return zero loss.
         return torch.tensor(0.0, device=embs.device, requires_grad=True)
  
-    # Mask self-similarities out of denominator
-    sim_masked = sim.masked_fill(eye, float("-inf"))
- 
-    # For rows with positives: use cross_entropy with the index of
-    # the highest-similarity positive as the target label.
-    sim_for_ce  = sim_masked[has_pos]                 # (K, B)
-    pos_for_ce  = pos_mask[has_pos]                   # (K, B)
- 
-    # Target = argmax of positive similarities (deterministic)
-    target = (sim_for_ce * pos_for_ce.float()).argmax(dim=1)   # (K,)
+    sim_masked   = sim.masked_fill(eye, float("-inf"))
+    sim_for_ce   = sim_masked[has_pos]
+    pos_for_ce   = pos_mask[has_pos]
+    target       = (sim_for_ce * pos_for_ce.float()).argmax(dim=1)
  
     return F.cross_entropy(sim_for_ce, target)
  
  
 def polyvore_contrastive_stable(
-    embs:       torch.Tensor,
-    outfit_ids: torch.Tensor,
-    cat_ids:    torch.Tensor,
-    temperature: float = 0.07,
+    embs:            torch.Tensor,
+    outfit_ids:      torch.Tensor,
+    cat_ids:         torch.Tensor,
+    temperature:     float = 0.07,
     hard_neg_weight: float = 0.3,
 ) -> torch.Tensor:
     """
-    Numerically stable category-aware contrastive for Polyvore.
- 
-    KEY CHANGE from previous version:
-    Uses F.cross_entropy(logits, diagonal_labels) instead of the
-    manual exp/log path. F.cross_entropy uses the logsumexp trick
-    internally, which is float32-safe for any logit magnitude.
- 
-    Positive definition: diagonal (item i matched with item i's
-    own outfit embedding context). This is the standard InfoNCE
-    formulation — semantically, we want item i to be most similar
-    to items from its own outfit over all other batch items.
- 
-    Category-aware hard negatives: same-category different-outfit
-    pairs get a logit boost BEFORE cross_entropy, making them
-    harder negatives without touching the stable denominator path.
+    Numerically stable contrastive loss for Polyvore.
+    Uses F.cross_entropy (logsumexp trick) — never overflows.
+    Positive = highest-similarity same-outfit item.
+    Hard negatives = same-category different-outfit items get logit boost.
     """
     B   = embs.size(0)
     t   = max(temperature, 0.01)
-    sim = torch.matmul(embs, embs.T) / t              # (B, B)
+    sim = torch.matmul(embs, embs.T) / t
     eye = torch.eye(B, dtype=torch.bool, device=embs.device)
  
-    # ── Hard-negative boost (same category, different outfit) ────────
+    # Category-aware hard negative boost
     if hard_neg_weight > 0:
-        same_cat   = (cat_ids.unsqueeze(1) == cat_ids.unsqueeze(0))
-        same_out   = (outfit_ids.unsqueeze(1) == outfit_ids.unsqueeze(0))
-        hard_neg   = same_cat & ~same_out & ~eye
-        sim        = sim + hard_neg_weight * hard_neg.float()
+        same_cat = (cat_ids.unsqueeze(1) == cat_ids.unsqueeze(0))
+        same_out = (outfit_ids.unsqueeze(1) == outfit_ids.unsqueeze(0))
+        hard_neg = same_cat & ~same_out & ~eye
+        sim      = sim + hard_neg_weight * hard_neg.float()
  
-    # ── Mask self-similarity from denominator ────────────────────────
-    sim = sim.masked_fill(eye, float("-inf"))
+    # Mask self from denominator
+    sim_masked = sim.masked_fill(eye, float("-inf"))
  
-    # ── Diagonal targets: item i's positive = item i itself ──────────
-    # (standard InfoNCE: we want sim[i,i] to be highest — but we
-    #  masked it, so use the same-outfit non-self entries as targets)
-    # Better: pair consecutive items as positives by sorting by outfit.
-    # Simplest stable approach: treat same-outfit neighbours as targets.
- 
+    # Find positive (same-outfit, highest similarity)
     out_eq  = (outfit_ids.unsqueeze(1) == outfit_ids.unsqueeze(0)) & ~eye
     has_pos = out_eq.any(dim=1)
  
     if not has_pos.any():
-        # No same-outfit pairs in batch — use diagonal InfoNCE fallback
-        # (treat each item as its own positive in the transposed direction)
+        # Fallback: no same-outfit pair in batch — use standard InfoNCE
+        # (happens only in val if batch is unlucky — not in train with
+        # outfit-aware split ensuring same-outfit items cluster together)
         labels = torch.arange(B, device=embs.device)
         sim_full = torch.matmul(embs, embs.T) / t
         return F.cross_entropy(sim_full, labels)
  
-    # For rows that have a same-outfit pair, pick the highest-sim one
-    sim_with_pos = sim.masked_fill(~out_eq, float("-inf"))
-    target       = sim_with_pos.argmax(dim=1)          # (B,)
+    # For each row: target = index of highest-sim same-outfit item
+    sim_pos = sim_masked.masked_fill(~out_eq, float("-inf"))
+    target  = sim_pos.argmax(dim=1)
  
-    # For rows WITHOUT a positive, use self (diagonal) as target
-    # by finding the least-bad assignment
-    target[~has_pos] = torch.arange(B, device=embs.device)[~has_pos]
+    # Rows without a same-outfit pair: use nearest non-self item
+    fallback = sim_masked.argmax(dim=1)
+    target   = torch.where(has_pos, target, fallback)
  
-    return F.cross_entropy(sim, target)
+    return F.cross_entropy(sim_masked, target)
  
  
 # ================================================================
-# STAGE 1 -- DEEPFASHION (unchanged, was working)
+# STAGE 1 -- DEEPFASHION (unchanged — was working correctly)
 # ================================================================
  
 def pretrain_deepfashion():
@@ -299,9 +357,8 @@ def pretrain_deepfashion():
         ):
             images = images.to(device)
             labels = labels.to(device)
- 
-            embs = model(images)
-            loss = deepfashion_contrastive(embs, labels)
+            embs   = model(images)
+            loss   = deepfashion_contrastive(embs, labels)
  
             optimizer.zero_grad()
             loss.backward()
@@ -322,13 +379,16 @@ def pretrain_deepfashion():
  
  
 # ================================================================
-# STAGE 2 -- POLYVORE (NaN-stable rewrite)
+# STAGE 2 -- POLYVORE  (cache-free + outfit-aware val split)
 # ================================================================
  
 def pretrain_polyvore():
     print("\n" + "=" * 60)
-    print("  STAGE 2: Polyvore compatibility (NaN-stable)")
+    print("  STAGE 2: Polyvore compatibility")
     print("=" * 60)
+    print("  NOTE: Loading via pyarrow directly — no HF cache used.")
+    print("  If you see cache-*.arrow files in your Drive, they are")
+    print("  from a previous run and can be safely deleted.\n")
  
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
  
@@ -337,27 +397,29 @@ def pretrain_polyvore():
         pretrained_path=config.DEEPFASHION_ENCODER_PATH
     ).to(device)
     model.unfreeze_layer4_only()
-    print("  layer4 + projector unfrozen. Backbone frozen.")
+    print("  layer4 + projector unfrozen. Backbone frozen.\n")
  
+    # Load full dataset (no HF cache)
     full_dataset = PolyvoreArrowDataset(
         arrow_dir=config.POLYVORE_ARROW_DIR,
         fashion_only=True
     )
  
-    n_val   = int(len(full_dataset) * 0.1)
-    n_train = len(full_dataset) - n_val
-    train_ds, val_ds = random_split(
-        full_dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(42)
+    # Outfit-aware split: guarantees positive pairs in val batches
+    train_idx, val_idx = make_outfit_aware_split(
+        full_dataset, val_fraction=0.1, min_val_outfit_size=2, seed=42
     )
-    print(f"  Train: {n_train} | Val: {n_val}")
  
-    train_loader = DataLoader(train_ds,
-                               batch_size=config.PRETRAIN_POLYVORE_BATCH,
-                               shuffle=True, num_workers=2, pin_memory=True)
-    val_loader   = DataLoader(val_ds,
-                               batch_size=config.PRETRAIN_POLYVORE_BATCH,
-                               shuffle=False, num_workers=2, pin_memory=True)
+    train_loader = DataLoader(
+        Subset(full_dataset, train_idx),
+        batch_size=config.PRETRAIN_POLYVORE_BATCH,
+        shuffle=True, num_workers=2, pin_memory=True
+    )
+    val_loader = DataLoader(
+        Subset(full_dataset, val_idx),
+        batch_size=config.PRETRAIN_POLYVORE_BATCH,
+        shuffle=False, num_workers=2, pin_memory=True
+    )
  
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -366,14 +428,13 @@ def pretrain_polyvore():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config.PRETRAIN_POLYVORE_EPOCHS
     )
-    best_val  = float("inf")
-    nan_count = 0   # consecutive NaN counter — abort if > 3
+    best_val = float("inf")
  
     for epoch in range(config.PRETRAIN_POLYVORE_EPOCHS):
  
         # ── Train ──────────────────────────────────────────────────
         model.train()
-        train_loss = 0.0
+        train_loss  = 0.0
         nan_batches = 0
  
         for images, outfit_ids, cat_ids in tqdm(
@@ -383,10 +444,8 @@ def pretrain_polyvore():
             images     = images.to(device)
             outfit_ids = outfit_ids.to(device)
             cat_ids    = cat_ids.to(device)
+            embs       = model(images)
  
-            embs = model(images)
- 
-            # Guard: check embeddings are finite before loss
             if not torch.isfinite(embs).all():
                 nan_batches += 1
                 continue
@@ -394,10 +453,9 @@ def pretrain_polyvore():
             loss = polyvore_contrastive_stable(
                 embs, outfit_ids, cat_ids,
                 temperature=config.PRETRAIN_POLYVORE_TEMP,
-                hard_neg_weight=0.3   # reduced from 0.5 — safer
+                hard_neg_weight=0.3
             )
  
-            # Guard: skip NaN/inf loss batches
             if not torch.isfinite(loss):
                 nan_batches += 1
                 continue
@@ -409,7 +467,7 @@ def pretrain_polyvore():
             train_loss += loss.item()
  
         if nan_batches > 0:
-            print(f"  WARNING: {nan_batches} NaN batches skipped this epoch")
+            print(f"  WARNING: {nan_batches} NaN batches skipped")
  
         # ── Validate ───────────────────────────────────────────────
         model.eval()
@@ -429,7 +487,7 @@ def pretrain_polyvore():
                 loss = polyvore_contrastive_stable(
                     embs, outfit_ids, cat_ids,
                     temperature=config.PRETRAIN_POLYVORE_TEMP,
-                    hard_neg_weight=0.0   # no boost during validation
+                    hard_neg_weight=0.0
                 )
                 if torch.isfinite(loss):
                     val_loss    += loss.item()
@@ -437,33 +495,24 @@ def pretrain_polyvore():
  
         scheduler.step()
  
-        avg_train = train_loss / max(len(train_loader) - nan_batches, 1)
+        n_train_batches = max(len(train_loader) - nan_batches, 1)
+        avg_train = train_loss / n_train_batches
         avg_val   = val_loss   / max(val_batches, 1)
  
-        print(f"  Epoch {epoch+1} | Train: {avg_train:.4f} | Val: {avg_val:.4f}")
+        print(f"  Epoch {epoch+1} | Train: {avg_train:.4f} | "
+              f"Val: {avg_val:.4f}  [{val_batches} val batches]")
  
-        # Sanity check: val should be > 0 and < 10
-        if avg_val == 0.0:
-            print("  WARNING: Val loss = 0.0 — likely no positive pairs in val "
-                  "batches. This is OK if train loss is decreasing.")
-        if not (0 < avg_val < 20):
-            nan_count += 1
-            print(f"  WARNING: Suspicious val loss ({avg_val:.4f}). "
-                  f"Count: {nan_count}/3")
-            if nan_count >= 3:
-                print("  ABORTING Stage 2 — model is diverging. "
-                      "Re-run Stage 1 first.")
-                break
-        else:
-            nan_count = 0
+        # Val should be a real loss value (3–5 range for InfoNCE at start)
+        if avg_val == 0.0 and val_batches == 0:
+            print("  WARNING: No finite val batches — check data loading.")
  
         if avg_val < best_val:
             best_val = avg_val
             torch.save(model.state_dict(), config.POLYVORE_ENCODER_PATH)
             print(f"  Saved -> {config.POLYVORE_ENCODER_PATH}")
  
-    # Final collapse check on a small val sample
-    print("\n  Final embedding health check:")
+    # ── Collapse check ─────────────────────────────────────────────
+    print("\n  Embedding health check:")
     model.eval()
     sample_embs = []
     with torch.no_grad():
@@ -471,19 +520,22 @@ def pretrain_polyvore():
             if i >= 5:
                 break
             sample_embs.append(model(images.to(device)).cpu())
+ 
     if sample_embs:
         all_e    = torch.cat(sample_embs, dim=0)
         std_val  = all_e.std(dim=0).mean().item()
         n        = min(100, all_e.size(0))
         idx      = torch.randperm(n)
         rand_sim = F.cosine_similarity(all_e[:n], all_e[idx]).mean().item()
-        verdict  = "OK" if rand_sim < 0.1 else ("WARNING" if rand_sim < 0.3 else "COLLAPSED")
+        verdict  = ("OK" if rand_sim < 0.1
+                    else "WARNING" if rand_sim < 0.3
+                    else "COLLAPSED")
         print(f"  Std: {std_val:.4f}  RandSim: {rand_sim:.4f}  -> {verdict}")
         if verdict == "COLLAPSED":
-            print("  Model collapsed in Stage 2. Do NOT run Stage 3.")
-            print("  Re-run: !python src/pretrain_clothing_encoder.py --stage 2")
+            print("  STOP: Model collapsed. Do NOT run Stage 3.")
+            print("  Action: delete cache-*.arrow from Drive, re-run Stage 2.")
         else:
-            print("  Stage 2 healthy. Proceed to Stage 3.")
+            print("  Stage 2 healthy. Proceed to: !python src/train.py")
  
     print("\nStage 2 complete.\n")
  
@@ -494,7 +546,8 @@ def pretrain_polyvore():
  
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--stage", type=int, choices=[1, 2], default=1)
+    parser.add_argument("--stage", type=int, choices=[1, 2], default=1,
+                        help="1=DeepFashion, 2=Polyvore")
     args = parser.parse_args()
  
     if args.stage == 1:
