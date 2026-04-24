@@ -106,8 +106,12 @@ class PolyvoreArrowDataset(Dataset):
         # Read all shards into memory as a list of dicts
         raw_rows = []
         for path in shard_paths:
-            reader = pa.ipc.open_file(path)
-            table  = reader.read_all()
+            import pyarrow.ipc as ipc
+
+            with pa.memory_map(path, 'r') as source:
+                reader = ipc.RecordBatchStreamReader(source)
+                table = reader.read_all()
+            
             # Convert to Python dicts row by row
             n = table.num_rows
             # Get column arrays
@@ -400,11 +404,9 @@ def pretrain_polyvore():
     print("  layer4 + projector unfrozen. Backbone frozen.\n")
  
     # Load full dataset (no HF cache)
-    full_dataset = PolyvoreArrowDataset(
-        arrow_dir=config.POLYVORE_ARROW_DIR,
-        fashion_only=True
-    )
- 
+    full_dataset = PolyvoreArrowDataset(config.POLYVORE_ARROW_DIR)
+    
+    
     # Outfit-aware split: guarantees positive pairs in val batches
     train_idx, val_idx = make_outfit_aware_split(
         full_dataset, val_fraction=0.1, min_val_outfit_size=2, seed=42
