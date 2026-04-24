@@ -42,22 +42,25 @@ class EarlyStopping:
         self.counter    = 0
         self.best_epoch = 0
  
-    def step(self, val_loss: float, model, epoch: int) -> bool:
-        """Returns True if training should stop."""
-        if val_loss < self.best_loss:
-            self.best_loss  = val_loss
-            self.counter    = 0
-            self.best_epoch = epoch
-            torch.save(model.state_dict(), self.save_path)
-            print(f"  ✓ Best model saved (epoch {epoch+1}, val={val_loss:.4f})")
-        else:
-            self.counter += 1
-            print(f"  No improvement ({self.counter}/{self.patience})")
-            if self.counter >= self.patience:
-                print(f"\n  Early stopping at epoch {epoch+1}. "
-                      f"Best was epoch {self.best_epoch+1}.")
-                return True
-        return False
+    def quick_recall_at5(model, val_loader, device, n_batches=10):
+        """Fast Recall@5 estimate on first n_batches of val set."""
+        model.eval()
+        body_embs, cloth_embs = [], []
+        with torch.no_grad():
+            for i, batch in enumerate(val_loader):
+                if i >= n_batches: break
+                b = model.encode_body(batch["body"].to(device)).cpu()
+                c = model.encode_cloth(batch["image"].to(device)).cpu()
+                body_embs.append(b)
+                cloth_embs.append(c)
+
+        body_embs  = torch.cat(body_embs)   # (N, 128)
+        cloth_embs = torch.cat(cloth_embs)  # (N, 128)
+        sims       = torch.matmul(body_embs, cloth_embs.T)  # (N, N)
+        labels     = torch.arange(len(body_embs))
+        top5       = sims.topk(5, dim=1).indices             # (N, 5)
+        hits       = (top5 == labels.unsqueeze(1)).any(dim=1)
+        return hits.float().mean().item()
  
  
 # ================================================================
@@ -220,8 +223,9 @@ def train(
  
         scheduler.step()
  
-        if stopper.step(avg_val, model, epoch):
-            break   # early stopping
+        recall5 = quick_recall_at5(model, val_loader, device)
+        print(f"  Quick Recall@5: {recall5:.4f}")
+        if stopper.step(-recall5, model, epoch): break 
  
     # ── Plots ────────────────────────────────────────────────────────
     plt.figure(figsize=(12, 4))
