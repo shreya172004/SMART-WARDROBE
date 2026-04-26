@@ -154,5 +154,45 @@ def verify_polyvore(arrow_dir=config.POLYVORE_ARROW_DIR, n_samples=5):
     return dataset
 
 
+import random
+
+class OutfitBatchSampler:
+    def __init__(self, dataset, batch_size=32):
+        self.dataset = dataset
+        self.batch_size = batch_size
+
+        # group indices by outfit
+        self.outfit_to_indices = {}
+        for idx in range(len(dataset)):
+            _, outfit_id, _ = dataset[idx]
+            self.outfit_to_indices.setdefault(int(outfit_id), []).append(idx)
+
+        # keep only outfits with >=2 items
+        self.valid_outfits = [
+            k for k, v in self.outfit_to_indices.items() if len(v) >= 2
+        ]
+
+    def __iter__(self):
+        while True:
+            batch = []
+
+            # pick outfits
+            chosen_outfits = random.sample(
+                self.valid_outfits,
+                self.batch_size // 2
+            )
+
+            for outfit in chosen_outfits:
+                items = self.outfit_to_indices[outfit]
+
+                # pick 2 items from same outfit
+                pair = random.sample(items, 2)
+                batch.extend(pair)
+
+            yield batch[:self.batch_size]
+
+    def __len__(self):
+        return len(self.dataset) // self.batch_size
+
 if __name__ == "__main__":
     verify_polyvore()
