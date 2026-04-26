@@ -107,8 +107,7 @@ def evaluate_polyvore(model, sample_size=5000):
     print("="*55)
 
     dataset = PolyvoreDataset(
-        arrow_dir=config.POLYVORE_ARROW_DIR,
-        transform=get_eval_transform()
+    arrow_dir=config.POLYVORE_ARROW_DIR
     )
 
     model.eval()
