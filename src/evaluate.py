@@ -11,7 +11,7 @@ import argparse
 import config
 from model import ViBEModel
 from dataset import get_eval_transform
-from polyvore_dataset import PolyvoreDataset
+from polyvore_dataset import PolyvoreArrowDataset as PolyvoreDataset
 
 
 # ============================================================
