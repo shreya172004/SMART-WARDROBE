@@ -74,13 +74,14 @@ class BodyEncoder(nn.Module):
         super().__init__()
 
         self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.BatchNorm1d(128),   # stabilizes training
-            nn.ReLU(),
-            nn.Linear(128, 256),
-            nn.ReLU(),
-            nn.Linear(256, embedding_dim)
+        nn.Linear(input_dim, 256),
+        nn.BatchNorm1d(256),
+        nn.ReLU(),
+        nn.Linear(256, 256),
+        nn.ReLU(),
+        nn.Linear(256, embedding_dim)
         )
+        
 
     def forward(self, x):
         emb = self.net(x)
