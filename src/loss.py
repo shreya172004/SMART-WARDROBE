@@ -21,8 +21,8 @@ class DeboasedInfoNCELoss(nn.Module):
 
     def __init__(self,
                  init_temperature=0.07,
-                 fn_threshold=0.90,        # updated (your change)
-                 hard_neg_weight=0.2):     # updated (your change)
+                 fn_threshold=0.85,        # updated (from 0.90)
+                 hard_neg_weight=0.3):     # updated (from 0.2 -> 0.3)
         super().__init__()
 
         # log-space → stable optimization
