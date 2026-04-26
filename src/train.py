@@ -71,7 +71,7 @@ def quick_recall_at5(model, loader, device):
     total = 0
 
     with torch.no_grad():
-        for body, cloth, _ in loader:
+        for body, cloth, in loader:
 
             body = body.to(device)
             cloth = cloth.to(device)
