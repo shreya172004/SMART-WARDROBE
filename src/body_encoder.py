@@ -22,7 +22,7 @@ class BodyEncoder(nn.Module):
             nn.Linear(input_dim, 64),
             nn.BatchNorm1d(64),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.4),
  
             nn.Linear(64, 128),
             nn.BatchNorm1d(128),

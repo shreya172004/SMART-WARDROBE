@@ -130,7 +130,7 @@ def train():
 
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=config.LR, weight_decay=1e-4
+        lr=config.LR, weight_decay=3e-4   #from 1e-4
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.EPOCHS)
     stopper   = EarlyStopping(patience=config.EARLY_STOP_PATIENCE,

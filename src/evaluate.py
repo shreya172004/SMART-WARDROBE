@@ -161,6 +161,75 @@ def evaluate_polyvore(model, sample_size=5000):
         print(f"  Recall@{k}: {recalls[k]/N:.4f}")
 
 
+
+
+@torch.no_grad()
+def evaluate_fashionista_gallery(model, device, gallery_size=500, seed=42):
+    print("\n" + "="*60)
+    print("  Fashionista Gallery Retrieval")
+    print("="*60)
+
+    rng = random.Random(seed)
+
+    df = pd.read_csv(config.BODY_VECTOR_CSV)
+    cloth_paths = list(Path(config.TEST_DIR).glob("*.jpg"))
+    cloth_names = [p.name for p in cloth_paths]
+
+    df = df[df["image"].isin(cloth_names)].reset_index(drop=True)
+    print(f"  Test samples: {len(df)}")
+
+    print("  Computing clothing embeddings...")
+    cloth_embs = []
+    for p in tqdm(cloth_paths):
+        cloth_embs.append(encode_cloth(model, p, device))
+    cloth_embs = np.array(cloth_embs)
+
+    recall1 = recall5 = recall10 = 0
+    mrr_vals = []
+    valid = 0
+
+    for _, row in tqdm(df.iterrows(), total=len(df)):
+        gt = row["image"]
+        if gt not in cloth_names:
+            continue
+
+        body_vec = row.values[1:].astype(np.float32)
+        body_emb = encode_body(model, body_vec, device)
+
+        gt_idx = cloth_names.index(gt)
+
+        all_idx = list(range(len(cloth_embs)))
+        all_idx.remove(gt_idx)
+
+        sampled = rng.sample(all_idx, min(gallery_size - 1, len(all_idx)))
+        gallery_idx = sampled + [gt_idx]
+
+        gallery_emb = cloth_embs[gallery_idx]
+        gallery_names = [cloth_names[i] for i in gallery_idx]
+
+        scores = np.dot(gallery_emb, body_emb)
+        ranked = np.argsort(-scores)
+        ranked_names = [gallery_names[i] for i in ranked]
+
+        valid += 1
+        if gt in ranked_names[:1]:
+            recall1 += 1
+        if gt in ranked_names[:5]:
+            recall5 += 1
+        if gt in ranked_names[:10]:
+            recall10 += 1
+
+        rank = ranked_names.index(gt) + 1
+        mrr_vals.append(1.0 / rank)
+
+    print(f"\n  Gallery size: {gallery_size}")
+    print(f"  Recall@1  : {recall1 / max(valid,1):.4f}")
+    print(f"  Recall@5  : {recall5 / max(valid,1):.4f}")
+    print(f"  Recall@10 : {recall10 / max(valid,1):.4f}")
+    print(f"  MRR       : {np.mean(mrr_vals):.4f}")
+    
+    
+    
 # ============================================================
 # MAIN
 # ============================================================
