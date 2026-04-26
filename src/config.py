@@ -1,86 +1,120 @@
+# ================================================================
+# CONFIGURATION FILE — SMART WARDROBE
+# ================================================================
+# This file defines:
+# ✔ Dataset paths
+# ✔ Model hyperparameters
+# ✔ Training configurations (all stages)
+# ✔ Saved model paths
+#
+# Supports:
+# Stage 1 → DeepFashion (visual features)
+# Stage 2 → Polyvore (compatibility learning)
+# Stage 3 → Fashionista (body-aware alignment)
+# ================================================================
+
 import os
- 
+
 # ================================================================
 # BASE PATHS
 # ================================================================
-BASE_DIR = "/content/drive/MyDrive/SmartWardrobe/body_shape_recommendor/data"
+
 DRIVE_ROOT = "/content/drive/MyDrive/SmartWardrobe"
- 
-# Fashionista splits
+BASE_DIR   = os.path.join(DRIVE_ROOT, "body_shape_recommendor/data")
+
+# -------------------------
+# Fashionista Dataset (Stage 3)
+# -------------------------
 TRAIN_DIR       = os.path.join(BASE_DIR, "split/train")
 VAL_DIR         = os.path.join(BASE_DIR, "split/val")
 TEST_DIR        = os.path.join(BASE_DIR, "split/test")
 BODY_VECTOR_CSV = os.path.join(BASE_DIR, "body_vectors.csv")
- 
-# DeepFashion (Stage 1 pretraining — visual garment features)
+
+# -------------------------
+# DeepFashion Dataset (Stage 1)
+# -------------------------
 DEEPFASHION_DIR = os.path.join(BASE_DIR, "deepfashion_subset")
- 
-# ----------------------------------------------------------------
-# Polyvore  (Stage 2 pretraining — outfit compatibility)
+
+# -------------------------
+# Polyvore Dataset (Stage 2)
+# -------------------------
+# Stored as HuggingFace Arrow dataset
+# Contains:
+#   - image (PIL)
+#   - category (string)
+#   - item_ID (string → contains outfit grouping)
 #
-# Format: HuggingFace Arrow shards (loaded via datasets.load_from_disk)
-#
-# Drive structure:
-#   polyvore_dataset/
-#     data/
-#       dataset_info.json
-#       state.json
-#       data-00000-of-00006.arrow
-#       data-00001-of-00006.arrow
-#       ...
-#       data-00005-of-00006.arrow
-#
-# POLYVORE_ARROW_DIR  →  the "data" folder containing the .arrow shards.
-# load_from_disk() reads dataset_info.json + state.json automatically.
-#
-# Dataset schema (Marqo/polyvore, 94,100 rows):
-#   image    : PIL Image
-#   category : str   e.g. "Day Dresses", "Boots", "Handbags"
-#   text     : str   e.g. "tibi knit long sleeve dress"
-#   item_ID  : str   e.g. "100002074_1"
-#                         ─────────── ─
-#                         set_id      item_index
-#   Outfit grouping: items with the same set_id prefix (before "_")
-#   are from the same outfit → treated as compatible pairs.
-# ----------------------------------------------------------------
+# Items with same set_id belong to same outfit → used for compatibility learning
 POLYVORE_ARROW_DIR = "/content/drive/MyDrive/polyvore_dataset/data"
- 
+
 # ================================================================
 # MODEL SETTINGS
 # ================================================================
-IMAGE_SIZE     = 224
-EMBEDDING_DIM  = 128
-BODY_INPUT_DIM = 7
- 
+
+IMAGE_SIZE     = 224           # Input size for all models
+EMBEDDING_DIM  = 128           # Final embedding dimension
+BODY_INPUT_DIM = 7             # Number of body features
+
 # ================================================================
 # TRAINING HYPERPARAMETERS
 # ================================================================
- 
-# Stage 1 — DeepFashion visual pretraining
+
+# ------------------------------------------------
+# Stage 1 — DeepFashion (visual representation)
+# ------------------------------------------------
 PRETRAIN_DEEPFASHION_EPOCHS = 5
 PRETRAIN_DEEPFASHION_LR     = 1e-4
 PRETRAIN_DEEPFASHION_BATCH  = 64
 PRETRAIN_DEEPFASHION_TEMP   = 0.07
- 
-# Stage 2 — Polyvore compatibility pretraining
+
+# ------------------------------------------------
+# Stage 2 — Polyvore (compatibility learning)
+# ------------------------------------------------
 PRETRAIN_POLYVORE_EPOCHS = 5
-PRETRAIN_POLYVORE_LR     = 5e-5     # lower: fine-tuning on stage-1 weights
+PRETRAIN_POLYVORE_LR     = 5e-5      # lower LR → fine-tuning stage
 PRETRAIN_POLYVORE_BATCH  = 32
 PRETRAIN_POLYVORE_TEMP   = 0.07
- 
-# Stage 3 — Fashionista body alignment
-BATCH_SIZE   = 32
-LR           = 1e-4
-EPOCHS       = 10
-TEMPERATURE  = 0.07   # FIXED: was 0.03 → caused loss collapse
- 
-# Early stopping
-EARLY_STOP_PATIENCE = 3
- 
+
+# ------------------------------------------------
+# Stage 3 — Fashionista (body-aware recommendation)
+# ------------------------------------------------
+EPOCHS = 20
+BATCH_SIZE = 64           # reduce to 32 if GPU OOM
+LR = 1e-4
+TEMPERATURE = 0.07        # stable value (avoid collapse)
+
+# Early stopping (prevents overfitting)
+EARLY_STOP_PATIENCE = 5
+
 # ================================================================
-# SAVED CHECKPOINT PATHS
+# IMAGE NORMALIZATION (IMPORTANT)
 # ================================================================
+# Must be SAME across:
+# ✔ Training
+# ✔ DeepFashion evaluation
+# ✔ Polyvore evaluation
+
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+# ================================================================
+# SAVED MODEL PATHS
+# ================================================================
+
+# Stage 1 output
 DEEPFASHION_ENCODER_PATH = os.path.join(DRIVE_ROOT, "clothing_encoder_deepfashion.pth")
-POLYVORE_ENCODER_PATH    = os.path.join(DRIVE_ROOT, "clothing_encoder_polyvore.pth")
-BEST_MODEL_PATH          = os.path.join(DRIVE_ROOT, "best_vibe_model.pth")
- 
+
+# Stage 2 output
+POLYVORE_ENCODER_PATH = os.path.join(DRIVE_ROOT, "clothing_encoder_polyvore.pth")
+
+# Final trained model (Stage 3)
+BEST_MODEL_PATH = os.path.join(DRIVE_ROOT, "best_vibe_model.pth")
+
+# ================================================================
+# NOTES
+# ================================================================
+# ✔ Always ensure transforms use IMAGE_SIZE = 224
+# ✔ Keep preprocessing consistent across all stages
+# ✔ Use Polyvore + DeepFashion for evaluation (NOT Fashionista)
+# ✔ Fashionista is weak supervision → use only qualitatively
+# ================================================================
