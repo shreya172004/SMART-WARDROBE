@@ -63,10 +63,37 @@ class EarlyStopping:
         return hits.float().mean().item()
  
  
+
+def quick_recall_at5(model, loader, device):
+
+    model.eval()
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for body, cloth, _ in loader:
+
+            body = body.to(device)
+            cloth = cloth.to(device)
+
+            body_emb = model.encode_body(body)
+            cloth_emb = model.encode_cloth(cloth)
+
+            scores = torch.matmul(body_emb, cloth_emb.T)
+
+            top5 = scores.topk(5, dim=1).indices
+
+            for i in range(len(body)):
+                if i in top5[i]:
+                    correct += 1
+                total += 1
+
+    return correct / total
+
+
 # ================================================================
 # MAIN TRAINING FUNCTION
 # ================================================================
- 
 def train(
     epochs:              int   = config.EPOCHS,
     save_path:           str   = config.BEST_MODEL_PATH,
