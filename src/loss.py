@@ -50,64 +50,40 @@ class DeboasedInfoNCELoss(nn.Module):
     # ------------------------------------------------------------
     # FORWARD
     # ------------------------------------------------------------
-    def forward(self, body_emb, cloth_emb, body_vecs):
+    def forward(self, body_embs, cloth_embs, body_vecs=None):
 
-        B = body_emb.size(0)
-        t = self.temperature
+        # normalize
+        body_embs = F.normalize(body_embs, dim=1)
+        cloth_embs = F.normalize(cloth_embs, dim=1)
 
-        # similarity logits
-        logits = torch.matmul(body_emb, cloth_emb.T) / t
+        sim = torch.matmul(body_embs, cloth_embs.T) / self.temperature.clamp(min=1e-4)
 
-        # --------------------------------------------------------
-        # 1. MASK FALSE NEGATIVES (CRITICAL)
-        # --------------------------------------------------------
-        fn_mask = self._false_negative_mask(body_vecs)
+        batch_size = sim.size(0)
+        labels = torch.arange(batch_size, device=sim.device)
 
-        logits_debiased = logits.masked_fill(fn_mask, float("-inf"))
+        # =========================
+        # 1. BODY → CLOTH LOSS
+        # =========================
+        loss_b2c = F.cross_entropy(sim, labels)
+        loss_c2b = F.cross_entropy(sim.T, labels)
+        body_cloth_loss = 0.5 * (loss_b2c + loss_c2b)
 
-        # --------------------------------------------------------
-        # 2. HARD NEGATIVE EMPHASIS (SAFE VERSION)
-        # --------------------------------------------------------
-        if self.hard_neg_weight > 0:
-            with torch.no_grad():
-                eye = torch.eye(B, device=body_emb.device).bool()
-                neg_mask = ~eye & ~fn_mask
+        # =========================
+        # 2. CLOTH ↔ CLOTH LOSS (NEW)
+        # =========================
+        sim_cc = torch.matmul(cloth_embs, cloth_embs.T) / self.temperature.clamp(min=1e-4)
 
-                neg_logits = logits.masked_fill(~neg_mask, float("-inf"))
+        # positives = same index (identity)
+        loss_cc = F.cross_entropy(sim_cc, labels)
 
-                hardness = torch.softmax(neg_logits, dim=1)
+        # =========================
+        # 3. COMBINE
+        # =========================
+        lambda_cc = 0.3   # 🔥 VERY IMPORTANT (tuneable)
 
-                boost = (self.hard_neg_weight * hardness).clamp(max=0.5)
+        loss = body_cloth_loss + lambda_cc * loss_cc
 
-            logits_debiased = logits_debiased + boost * neg_mask.float()
-
-        # --------------------------------------------------------
-        # 3. SAFE CROSS ENTROPY
-        # --------------------------------------------------------
-        labels = torch.arange(B, device=body_emb.device)
-
-        # Guard: avoid all -inf rows
-        has_finite = torch.isfinite(logits_debiased).any(dim=1)
-
-        if not has_finite.all():
-            logits_debiased = torch.where(
-                has_finite.unsqueeze(1),
-                logits_debiased,
-                logits
-            )
-
-        loss_b2c = F.cross_entropy(logits_debiased, labels)
-        loss_c2b = F.cross_entropy(logits_debiased.T, labels)
-
-        loss = 0.5 * (loss_b2c + loss_c2b)
-
-        # --------------------------------------------------------
-        # FINAL SAFETY (NaN guard)
-        # --------------------------------------------------------
-        if not torch.isfinite(loss):
-            loss = torch.tensor(0.0, device=body_emb.device, requires_grad=True)
-
-        return loss, t.item()
+        return loss, self.temperature.detach()
 
 
 # ================================================================
