@@ -78,9 +78,10 @@ PRETRAIN_POLYVORE_TEMP   = 0.07
 # ------------------------------------------------
 # Stage 3 — Fashionista (body-aware recommendation)
 # ------------------------------------------------
-EPOCHS = 20
+EPOCHS = 25
+PATIENCE = 7
 BATCH_SIZE = 64           # reduce to 32 if GPU OOM
-LR = 1e-4
+LR = 5e-5   # instead of 1e-4
 TEMPERATURE = 0.07        # stable value (avoid collapse)
 
 # Early stopping (prevents overfitting)
