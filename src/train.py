@@ -1,13 +1,18 @@
 """
-train.py — Stage 3: Fashionista body-clothing alignment (FULLY FIXED)
+train.py — Stage 3: Fashionista body-clothing alignment
 
-Key fixes:
-  - Fixed all NameError/UnpackError crashes
-  - Dataset dict access → tuple unpack
-  - Proper model method names
-  - Removed broken nested class
-  - Added missing check_embedding_collapse
+Runs AFTER pretrain_clothing_encoder.py stages 1 and 2.
+Loads Polyvore-pretrained clothing encoder and aligns it to body measurements.
+
+Fixes in this version:
+  1. Removes broken duplicate quick_recall_at5 definitions
+  2. Uses dict-style batch access consistently: batch["body"], batch["image"]
+  3. Adds working EarlyStopping.step()
+  4. Adds robust quick Recall@5
+  5. Adds embedding collapse diagnostics locally
+  6. Keeps phase-1 freeze and phase-2 partial unfreeze
 """
+
 import os
 import torch
 import torch.nn.functional as F
@@ -20,82 +25,104 @@ from dataset import BodyClothDataset
 from model import ViBEModel
 from loss import DeboasedInfoNCELoss
 
+
 # ================================================================
-# MISSING: check_embedding_collapse (add this)
+# HELPERS
 # ================================================================
-def check_embedding_collapse(body_embs, cloth_embs):
-    """Print embedding health diagnostics."""
+class EarlyStopping:
+    """Stops training when monitored metric stops improving."""
+
+    def __init__(self, patience: int = 3, save_path: str = "best_model.pth"):
+        self.patience = patience
+        self.save_path = save_path
+        self.best_metric = float("inf")
+        self.counter = 0
+        self.best_epoch = 0
+
+    def step(self, metric_value, model, epoch):
+        improved = metric_value < self.best_metric
+        if improved:
+            self.best_metric = metric_value
+            self.counter = 0
+            self.best_epoch = epoch
+            torch.save(model.state_dict(), self.save_path)
+            print(f"  Saved best model -> {self.save_path}")
+            return False
+        else:
+            self.counter += 1
+            print(f"  EarlyStopping counter: {self.counter}/{self.patience}")
+            return self.counter >= self.patience
+
+
+def check_embedding_collapse(body_embs: torch.Tensor, cloth_embs: torch.Tensor):
+    """Simple embedding health check."""
     body_std = body_embs.std(dim=0).mean().item()
     cloth_std = cloth_embs.std(dim=0).mean().item()
-    
-    n = min(100, body_embs.size(0))
-    idx = torch.randperm(n)
-    rand_cloth_sim = F.cosine_similarity(
-        cloth_embs[:n], cloth_embs[idx]
-    ).mean().item()
-    
-    verdict = "OK" if rand_cloth_sim < 0.1 else "WARNING"
-    print(f"\n── Embedding health check ──────────────────")
+
+    n = min(100, cloth_embs.size(0))
+    if n >= 2:
+        idx = torch.randperm(n)
+        rand_cloth_sim = F.cosine_similarity(cloth_embs[:n], cloth_embs[idx], dim=1).mean().item()
+    else:
+        rand_cloth_sim = 1.0
+
+    verdict = "OK"
+    if body_std < 0.1 or cloth_std < 0.1 or rand_cloth_sim > 0.1:
+        verdict = "WARNING"
+
+    print("\n── Embedding health check ──────────────────")
     print(f"  Body std        : {body_std:.4f}  (want > 0.1)")
     print(f"  Cloth std       : {cloth_std:.4f}  (want > 0.1)")
     print(f"  Random cloth sim: {rand_cloth_sim:.4f}  (want < 0.1)")
     print(f"  Verdict         : {verdict}")
     print("────────────────────────────────────────────")
 
-# FIXED: EarlyStopping (no nested methods)
-class EarlyStopping:
-    """Stops training when val loss stops improving."""
-    def __init__(self, patience: int = 3, save_path: str = "best_model.pth"):
-        self.patience  = patience
-        self.save_path = save_path
-        self.best_loss = float("inf")
-        self.counter   = 0
-        self.best_epoch = 0
 
-    def step(self, val_metric, model, epoch):
-        if val_metric < self.best_loss:
-            self.best_loss = val_metric
-            self.counter = 0
-            self.best_epoch = epoch
-            torch.save(model.state_dict(), self.save_path)
-            print(f"  Saved best model (epoch {epoch+1})")
-            return False
-        self.counter += 1
-        return self.counter >= self.patience
-
-# FIXED: quick_recall_at5 (proper unpacking, normalization, tensor ops)
-def quick_recall_at5(model, loader, device):
+@torch.no_grad()
+def quick_recall_at5(model, loader, device, max_batches=None):
+    """
+    Fast batch-local Recall@5 sanity metric.
+    Assumes each body in a batch is paired with the cloth at the same batch index.
+    This is a quick diagnostic, not a final gallery-wide retrieval metric.
+    """
     model.eval()
     correct = 0
     total = 0
 
-    with torch.no_grad():
-        for batch in loader:  # ← FIXED: no unpacking here
-            # FIXED: your dataloader returns (body, image)
-            body_vec, cloth_img = batch[0].to(device), batch[1].to(device)
-            
-            body_emb = F.normalize(model.body_encoder(body_vec), dim=1)
-            cloth_emb = F.normalize(model.cloth_encoder(cloth_img), dim=1)
+    for batch_idx, batch in enumerate(loader):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
 
-            scores = torch.matmul(body_emb, cloth_emb.T)
-            top5 = scores.topk(k=min(5, scores.size(1)), dim=1).indices
+        body = batch["body"].to(device, non_blocking=True)
+        cloth = batch["image"].to(device, non_blocking=True)
 
-            for i in range(body_emb.size(0)):
-                # FIXED: proper tensor comparison
-                if (top5[i] == i).any().item():
-                    correct += 1
-                total += 1
+        body_emb = model.encode_body(body)
+        cloth_emb = model.encode_cloth(cloth)
+
+        body_emb = F.normalize(body_emb, dim=1)
+        cloth_emb = F.normalize(cloth_emb, dim=1)
+
+        scores = torch.matmul(body_emb, cloth_emb.T)
+        k = min(5, scores.size(1))
+        topk = scores.topk(k=k, dim=1).indices
+
+        labels = torch.arange(scores.size(0), device=topk.device).unsqueeze(1)
+        hits = (topk == labels).any(dim=1)
+
+        correct += hits.sum().item()
+        total += hits.numel()
 
     return correct / max(total, 1)
 
+
 # ================================================================
-# MAIN TRAINING FUNCTION (minor fixes)
+# MAIN TRAINING FUNCTION
 # ================================================================
 def train(
-    epochs:           int   = config.EPOCHS,
-    save_path:        str   = config.BEST_MODEL_PATH,
-    polyvore_ckpt:    str   = config.POLYVORE_ENCODER_PATH,
-    deepfashion_ckpt: str   = config.DEEPFASHION_ENCODER_PATH,
+    epochs: int = config.EPOCHS,
+    save_path: str = config.BEST_MODEL_PATH,
+    polyvore_ckpt: str = config.POLYVORE_ENCODER_PATH,
+    deepfashion_ckpt: str = config.DEEPFASHION_ENCODER_PATH,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\nUsing device: {device}")
@@ -116,13 +143,23 @@ def train(
         body_completeness_threshold=0.7
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE,
-                              shuffle=True, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE,
-                            shuffle=False, num_workers=2, pin_memory=True)
-
     print(f"  Dataset: {len(train_dataset)} valid samples from {config.TRAIN_DIR}")
     print(f"  Dataset: {len(val_dataset)} valid samples from {config.VAL_DIR}")
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True
+    )
 
     # ── Model ────────────────────────────────────────────────────────
     model = ViBEModel(
@@ -130,58 +167,79 @@ def train(
         embedding_dim=config.EMBEDDING_DIM
     ).to(device)
 
-    # Load pretrained clothing encoder
     if os.path.exists(polyvore_ckpt):
-        print(f"  Loading Polyvore-pretrained clothing encoder")
-        model.cloth_encoder.load_state_dict(
-            torch.load(polyvore_ckpt, map_location=device), strict=False)
+        print("  Loading Polyvore-pretrained clothing encoder")
+        state = torch.load(polyvore_ckpt, map_location=device)
+        model.cloth_encoder.load_state_dict(state, strict=False)
     elif os.path.exists(deepfashion_ckpt):
-        print(f"  Loading DeepFashion-pretrained clothing encoder")
-        model.cloth_encoder.load_state_dict(
-            torch.load(deepfashion_ckpt, map_location=device), strict=False)
+        print("  Loading DeepFashion-pretrained clothing encoder")
+        state = torch.load(deepfashion_ckpt, map_location=device)
+        model.cloth_encoder.load_state_dict(state, strict=False)
     else:
-        print("  WARNING: No pretrained encoder found — using ImageNet weights only")
+        print("  WARNING: No pretrained encoder found — using default initialization")
 
-    # ── Phase 1: freeze backbone ─────────────────────────────────────
+    # ── Phase 1 ─────────────────────────────────────────────────────
     model.cloth_encoder.freeze_backbone()
-    print(f"  Phase 1: backbone frozen")
+    print("  Phase 1: backbone frozen")
 
-    # ── Loss & optimizer ─────────────────────────────────────────────
+    # ── Loss ────────────────────────────────────────────────────────
     loss_fn = DeboasedInfoNCELoss(
         init_temperature=config.TEMPERATURE,
         fn_threshold=0.85,
         hard_neg_weight=0.3
     ).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.LR, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    # ── Optimizer ───────────────────────────────────────────────────
+    backbone_params = list(model.cloth_encoder.backbone.parameters())
+    body_params = list(model.body_encoder.parameters())
+    projector_params = list(model.cloth_encoder.projector.parameters())
+    loss_params = list(loss_fn.parameters())
 
-    stopper = EarlyStopping(patience=config.EARLY_STOP_PATIENCE, save_path=save_path)
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": body_params + projector_params + loss_params, "lr": config.LR},
+            {"params": backbone_params, "lr": config.LR * 0.01},
+        ],
+        weight_decay=1e-4
+    )
 
-    train_losses, val_losses = [], []
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs
+    )
+
+    stopper = EarlyStopping(
+        patience=config.EARLY_STOP_PATIENCE,
+        save_path=save_path
+    )
+
+    train_losses = []
+    val_losses = []
+    recall_history = []
     phase2_started = False
 
-    # ── Training loop ────────────────────────────────────────────────
+    # ── Training loop ───────────────────────────────────────────────
     for epoch in range(epochs):
-
-        # Phase 2: unfreeze layer4 at epoch 3
         if epoch == 3 and not phase2_started:
             model.cloth_encoder.unfreeze_layer4_only()
             print(f"\n  Phase 2: layer4 unfrozen (epoch {epoch+1})\n")
             phase2_started = True
 
-        # ── Train ──────────────────────────────────────────────────
+        # Train
         model.train()
         loss_fn.train()
         train_loss = 0.0
 
-        loop = tqdm(train_loader, desc=f"Train Ep {epoch+1}/{epochs}")
-        for batch in loop:
-            # FIXED: tuple unpacking instead of dict access
-            body_vec, cloth_img = batch[0].to(device), batch[1].to(device)
+        train_bar = tqdm(train_loader, desc=f"Train Ep {epoch+1}/{epochs}")
+        for batch in train_bar:
+            body_vec = batch["body"].to(device, non_blocking=True)
+            cloth_img = batch["image"].to(device, non_blocking=True)
 
             body_emb, cloth_emb = model(body_vec, cloth_img)
             loss, temp = loss_fn(body_emb, cloth_emb, body_vec)
+
+            if not torch.isfinite(loss):
+                print("  WARNING: non-finite train loss encountered, skipping batch")
+                continue
 
             optimizer.zero_grad()
             loss.backward()
@@ -189,12 +247,12 @@ def train(
             optimizer.step()
 
             train_loss += loss.item()
-            loop.set_postfix(loss=f"{loss.item():.4f}", temp=f"{temp:.3f}")
+            train_bar.set_postfix(loss=f"{loss.item():.4f}", temp=f"{float(temp):.3f}")
 
-        avg_train = train_loss / len(train_loader)
+        avg_train = train_loss / max(len(train_loader), 1)
         train_losses.append(avg_train)
 
-        # ── Validate ───────────────────────────────────────────────
+        # Validate
         model.eval()
         loss_fn.eval()
         val_loss = 0.0
@@ -202,62 +260,87 @@ def train(
         all_cloth_embs = []
 
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f"Val   Ep {epoch+1}/{epochs}"):
-                # FIXED: tuple unpacking
-                body_vec, cloth_img = batch[0].to(device), batch[1].to(device)
+            val_bar = tqdm(val_loader, desc=f"Val   Ep {epoch+1}/{epochs}")
+            for batch in val_bar:
+                body_vec = batch["body"].to(device, non_blocking=True)
+                cloth_img = batch["image"].to(device, non_blocking=True)
 
                 body_emb, cloth_emb = model(body_vec, cloth_img)
                 loss, _ = loss_fn(body_emb, cloth_emb, body_vec)
-                val_loss += loss.item()
 
+                if not torch.isfinite(loss):
+                    print("  WARNING: non-finite val loss encountered, skipping batch")
+                    continue
+
+                val_loss += loss.item()
                 all_body_embs.append(body_emb.cpu())
                 all_cloth_embs.append(cloth_emb.cpu())
 
-        avg_val = val_loss / len(val_loader)
+        avg_val = val_loss / max(len(val_loader), 1)
         val_losses.append(avg_val)
 
-        print(f"\nEpoch {epoch+1}/{epochs} | "
-              f"Train: {avg_train:.4f} | Val: {avg_val:.4f} | "
-              f"Temp: {loss_fn.temperature.item():.4f}")
-
-        # Collapse check
-        check_embedding_collapse(
-            torch.cat(all_body_embs, dim=0),
-            torch.cat(all_cloth_embs, dim=0)
+        print(
+            f"\nEpoch {epoch+1}/{epochs} | "
+            f"Train: {avg_train:.4f} | Val: {avg_val:.4f} | "
+            f"Temp: {loss_fn.temperature.item():.4f}"
         )
+
+        if len(all_body_embs) > 0 and len(all_cloth_embs) > 0:
+            check_embedding_collapse(
+                torch.cat(all_body_embs, dim=0),
+                torch.cat(all_cloth_embs, dim=0)
+            )
+
+        recall5 = quick_recall_at5(model, val_loader, device)
+        recall_history.append(recall5)
+        print(f"  Quick Recall@5: {recall5:.4f}")
 
         scheduler.step()
 
-        # FIXED: call works now
-        recall5 = quick_recall_at5(model, val_loader, device)
-        print(f"  Quick Recall@5: {recall5:.4f}")
-
+        # Early stop on Recall@5 improvement; negate so "lower is better" logic still works
         if stopper.step(-recall5, model, epoch):
+            print("  Early stopping triggered.")
             break
 
     # ── Plots ────────────────────────────────────────────────────────
-    plt.figure(figsize=(12, 4))
-    plt.subplot(1, 2, 1)
+    out_dir = "/content/drive/MyDrive/SmartWardrobe"
+    os.makedirs(out_dir, exist_ok=True)
+
+    plt.figure(figsize=(14, 4))
+
+    plt.subplot(1, 3, 1)
     plt.plot(train_losses, label="Train")
     plt.plot(val_losses, label="Val")
     plt.axvline(stopper.best_epoch, color="green", linestyle="--",
-                label=f"Best (ep {stopper.best_epoch+1})")
+                label=f"Best ep {stopper.best_epoch+1}")
     plt.title("Loss curves")
     plt.legend()
 
-    plt.subplot(1, 2, 2)
+    plt.subplot(1, 3, 2)
     plt.plot(train_losses, label="Train")
     plt.plot(val_losses, label="Val")
     plt.yscale("log")
-    plt.title("Loss curves (log scale)")
+    plt.title("Loss curves (log)")
+    plt.legend()
+
+    plt.subplot(1, 3, 3)
+    plt.plot(recall_history, label="Recall@5")
+    plt.axvline(stopper.best_epoch, color="green", linestyle="--",
+                label=f"Best ep {stopper.best_epoch+1}")
+    plt.title("Quick Recall@5")
     plt.legend()
 
     plt.tight_layout()
-    plt.savefig("/content/drive/MyDrive/SmartWardrobe/loss_curves.png", dpi=120)
+    plot_path = os.path.join(out_dir, "loss_curves.png")
+    plt.savefig(plot_path, dpi=120)
     plt.show()
 
-    print(f"\n✓ Training complete. Best epoch: {stopper.best_epoch+1}, "
-          f"best val loss: {stopper.best_loss:.4f}")
+    print(
+        f"\n✓ Training complete. Best epoch: {stopper.best_epoch + 1}, "
+        f"best monitored metric: {stopper.best_metric:.4f}"
+    )
+    print(f"  Plot saved -> {plot_path}")
+
 
 if __name__ == "__main__":
     train()
