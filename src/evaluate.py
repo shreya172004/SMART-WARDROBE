@@ -251,4 +251,4 @@ if __name__ == "__main__":
         evaluate_polyvore(model)
         
     if args.mode in ["fashionista", "all"]:
-        evaluate_fashionista_gallery(model)
+        evaluate_fashionista_gallery(model, device= device)
