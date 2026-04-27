@@ -237,7 +237,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--mode",
-        choices=["deepfashion", "polyvore", "all"],
+        choices=["deepfashion", "polyvore","fashionista", "all"],
         default="all"
     )
     args = parser.parse_args()
@@ -249,3 +249,6 @@ if __name__ == "__main__":
 
     if args.mode in ["polyvore", "all"]:
         evaluate_polyvore(model)
+        
+    if args.mode in ["fashionista", "all"]:
+        evaluate_fashionista_gallery(model)
