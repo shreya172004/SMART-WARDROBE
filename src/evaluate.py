@@ -34,6 +34,30 @@ def load_model():
 
 
 # ============================================================
+# HELPER FUNCTIONS (🔥 FIXED)
+# ============================================================
+transform = get_eval_transform()
+
+def encode_cloth(model, img_path, device):
+    img = Image.open(img_path).convert("RGB")
+    img = transform(img).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        emb = model.encode_cloth(img)
+
+    return emb.cpu().numpy()[0]
+
+
+def encode_body(model, body_vec, device):
+    body_vec = torch.tensor(body_vec, dtype=torch.float32).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        emb = model.encode_body(body_vec)
+
+    return emb.cpu().numpy()[0]
+
+
+# ============================================================
 # DEEPFASHION EVALUATION
 # ============================================================
 @torch.no_grad()
@@ -44,14 +68,6 @@ def evaluate_deepfashion(model):
 
     QUERY_DIR = "/content/drive/MyDrive/SmartWardrobe/deepfashion_test_subset/queries"
     GALLERY_DIR = "/content/drive/MyDrive/SmartWardrobe/deepfashion_test_subset/gallery"
-
-    transform = get_eval_transform()
-
-    def extract_embedding(img_path):
-        img = Image.open(img_path).convert("RGB")
-        img = transform(img).unsqueeze(0).to(device)
-        emb = model.encode_cloth(img)
-        return emb.cpu().numpy()[0]
 
     def extract_id(path):
         parts = path.name.split("_")
@@ -67,7 +83,7 @@ def evaluate_deepfashion(model):
     gallery_ids = []
 
     for p in tqdm(gallery_paths):
-        gallery_embs.append(extract_embedding(p))
+        gallery_embs.append(encode_cloth(model, p, device))
         gallery_ids.append(extract_id(p))
 
     gallery_embs = np.array(gallery_embs)
@@ -79,7 +95,7 @@ def evaluate_deepfashion(model):
 
     print("  Evaluating queries...")
     for q in tqdm(query_paths):
-        q_emb = extract_embedding(q)
+        q_emb = encode_cloth(model, q, device)
         q_id = extract_id(q)
 
         scores = np.dot(gallery_embs, q_emb)
@@ -100,7 +116,7 @@ def evaluate_deepfashion(model):
 
 
 # ============================================================
-# POLYVORE EVALUATION (YOUR DATASET)
+# POLYVORE (⚠️ keep but not primary metric)
 # ============================================================
 @torch.no_grad()
 def evaluate_polyvore(model, sample_size=5000):
@@ -108,13 +124,8 @@ def evaluate_polyvore(model, sample_size=5000):
     print("  Polyvore Compatibility Evaluation")
     print("="*55)
 
-    dataset = PolyvoreDataset(
-    arrow_dir=config.POLYVORE_ARROW_DIR
-    )
+    dataset = PolyvoreDataset(arrow_dir=config.POLYVORE_ARROW_DIR)
 
-    model.eval()
-
-    # sample subset (important)
     if len(dataset) > sample_size:
         indices = torch.randperm(len(dataset))[:sample_size]
     else:
@@ -131,7 +142,6 @@ def evaluate_polyvore(model, sample_size=5000):
 
         img = img.unsqueeze(0).to(device)
         emb = model.encode_cloth(img)
-        emb = F.normalize(emb, dim=1)
 
         all_embs.append(emb.cpu())
         outfit_ids.append(outfit_id)
@@ -147,12 +157,12 @@ def evaluate_polyvore(model, sample_size=5000):
         query = all_embs[i].unsqueeze(0)
         sims = torch.matmul(query, all_embs.T).squeeze(0)
 
-        sims[i] = -1  # remove self
+        sims[i] = -1
 
         ranked = torch.argsort(sims, descending=True)
         gt = outfit_ids[i]
 
-        for k in recalls.keys():
+        for k in recalls:
             topk = ranked[:k]
             if any(outfit_ids[j] == gt for j in topk):
                 recalls[k] += 1
@@ -162,8 +172,9 @@ def evaluate_polyvore(model, sample_size=5000):
         print(f"  Recall@{k}: {recalls[k]/N:.4f}")
 
 
-
-
+# ============================================================
+# FASHIONISTA (🔥 MAIN METRIC)
+# ============================================================
 @torch.no_grad()
 def evaluate_fashionista_gallery(model, device, gallery_size=500, seed=42):
     print("\n" + "="*60)
@@ -228,9 +239,8 @@ def evaluate_fashionista_gallery(model, device, gallery_size=500, seed=42):
     print(f"  Recall@5  : {recall5 / max(valid,1):.4f}")
     print(f"  Recall@10 : {recall10 / max(valid,1):.4f}")
     print(f"  MRR       : {np.mean(mrr_vals):.4f}")
-    
-    
-    
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -238,7 +248,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--mode",
-        choices=["deepfashion", "polyvore","fashionista", "all"],
+        choices=["deepfashion", "polyvore", "fashionista", "all"],
         default="all"
     )
     args = parser.parse_args()
@@ -250,6 +260,6 @@ if __name__ == "__main__":
 
     if args.mode in ["polyvore", "all"]:
         evaluate_polyvore(model)
-        
+
     if args.mode in ["fashionista", "all"]:
-        evaluate_fashionista_gallery(model, device= device)
+        evaluate_fashionista_gallery(model, device=device)
