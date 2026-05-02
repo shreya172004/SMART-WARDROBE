@@ -45,7 +45,7 @@ async function scrape(url) {
 
         await browser.close();
 
-        // 🔥 Deduplicate
+        //  Deduplicate
         const unique = [];
         const seen = new Set();
 
@@ -56,7 +56,7 @@ async function scrape(url) {
             }
         }
 
-        console.log("Found:", unique.length);
+        console.log("Valid products saved:", validProducts.length);
 
         return unique.slice(0, 60);
     } catch (err) {
