@@ -25,7 +25,7 @@ sys.path.insert(0, "/content/SMART-WARDROBE/demo")
  
 import config
 from model import ViBEModel
-from scraper import scrape_products, download_product_images
+from scrapper import scrape_products, download_product_images
 from body_prior import BodyShapePrior
  
  
