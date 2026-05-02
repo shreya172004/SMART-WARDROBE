@@ -1,17 +1,15 @@
 # ================================================================
-# SmartWardrobe Recommender (Clean + Fixed Version)
+# SmartWardrobe Recommender (FINAL FIXED VERSION)
 # ================================================================
 
 import sys
 import os
-import json
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 
-# Add project paths
 sys.path.insert(0, "/content/SMART-WARDROBE/src")
 sys.path.insert(0, "/content/SMART-WARDROBE/demo")
 
@@ -22,7 +20,7 @@ from body_prior import BodyShapePrior
 
 
 # ================================================================
-# Image Transform (USED EVERYWHERE)
+# TRANSFORM
 # ================================================================
 IMAGE_TRANSFORM = transforms.Compose([
     transforms.Resize((256, 256)),
@@ -36,27 +34,17 @@ IMAGE_TRANSFORM = transforms.Compose([
 
 
 # ================================================================
-# MAIN CLASS
+# CLASS
 # ================================================================
 class SmartWardrobeRecommender:
 
-    def __init__(
-        self,
-        model_path=None,
-        prior_path=None,
-        prior_alpha=0.25,
-        device=None
-    ):
+    def __init__(self, model_path=None, prior_path=None, prior_alpha=0.25, device=None):
 
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-
+        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.device = torch.device(device)
         self.prior_alpha = prior_alpha
 
-        # -------------------------
         # Load model
-        # -------------------------
         self.model = ViBEModel(
             body_input_dim=config.BODY_INPUT_DIM,
             embedding_dim=config.EMBEDDING_DIM
@@ -65,18 +53,14 @@ class SmartWardrobeRecommender:
         ckpt = model_path or config.BEST_MODEL_PATH
 
         if os.path.exists(ckpt):
-            self.model.load_state_dict(
-                torch.load(ckpt, map_location=self.device)
-            )
+            self.model.load_state_dict(torch.load(ckpt, map_location=self.device))
             print(f"Model loaded from {ckpt}")
         else:
             print(f"WARNING: checkpoint not found at {ckpt}")
 
         self.model.eval()
 
-        # -------------------------
-        # Load body prior
-        # -------------------------
+        # Load prior
         self.prior = None
         if prior_path and os.path.exists(prior_path):
             self.prior = BodyShapePrior.load(prior_path)
@@ -103,6 +87,7 @@ class SmartWardrobeRecommender:
 
         for p in products:
             img = p.get("image")
+
             if img is None:
                 continue
 
@@ -110,7 +95,8 @@ class SmartWardrobeRecommender:
                 emb = self.encode_cloth(img)
                 valid.append(p)
                 embeddings.append(emb)
-            except:
+            except Exception as e:
+                print("Encoding failed:", e)
                 continue
 
         if not embeddings:
@@ -123,22 +109,47 @@ class SmartWardrobeRecommender:
     # RANKING
     # ============================================================
 
-    def _score_and_rank(self, body_vec, body_emb, cloth_embs, top_k):
+    def _rank(self, sims, top_k):
+        idx = np.argsort(-sims)[:top_k]
+        return idx
 
-        base_scores = torch.matmul(cloth_embs, body_emb.T).squeeze(1).numpy()
 
-        if self.prior is not None:
-            final_scores = self.prior.rerank(
-                body_vec=body_vec,
-                cloth_embs=cloth_embs.numpy(),
-                base_scores=base_scores,
-                alpha=self.prior_alpha
-            )
-        else:
-            final_scores = base_scores
+    # ============================================================
+    # IMAGE MODE
+    # ============================================================
 
-        top_idx = np.argsort(-final_scores)[:top_k]
-        return top_idx, final_scores
+    def recommend(self, user_image_path, products, category, top_k=5):
+
+        print(f"Using preloaded products: {len(products)}")
+
+        # Load user image
+        user_img = Image.open(user_image_path).convert("RGB")
+        user_emb = self.encode_cloth(user_img)
+
+        # Load product images
+        products = download_product_images(products)
+
+        valid, cloth_embs = self.encode_products(products)
+
+        if not valid:
+            print("No valid products after encoding")
+            return []
+
+        sims = torch.matmul(cloth_embs, user_emb.T).squeeze(1).numpy()
+
+        top_idx = self._rank(sims, top_k)
+
+        results = []
+        for rank, idx in enumerate(top_idx):
+            p = valid[idx].copy()
+            p.pop("image", None)
+
+            p["similarity"] = float(sims[idx])
+            p["rank"] = rank + 1
+
+            results.append(p)
+
+        return results
 
 
     # ============================================================
@@ -155,9 +166,7 @@ class SmartWardrobeRecommender:
         products=None
     ):
 
-        # -------------------------
-        # Convert measurements → body vector
-        # -------------------------
+        # Convert measurements
         h   = measurements.get("height_cm", 165) / 100
         b   = measurements.get("bust_cm", 88) / 100
         w   = measurements.get("waist_cm", 70) / 100
@@ -171,84 +180,25 @@ class SmartWardrobeRecommender:
 
         body_emb = self.encode_body(body_vec)
 
-        # -------------------------
-        # Get products
-        # -------------------------
         if products is None:
             print(f"Scraping {website_url}...")
             products = scrape_products(website_url, category, max_scrape)
 
             if not products:
-                print("No products scraped")
                 return []
-
         else:
             print(f"Using preloaded products: {len(products)}")
 
-        # -------------------------
-        # Load images
-        # -------------------------
         products = download_product_images(products)
 
         valid, cloth_embs = self.encode_products(products)
 
         if not valid:
-            print("No valid products after encoding")
             return []
 
-        # -------------------------
-        # Ranking
-        # -------------------------
-        top_idx, scores = self._score_and_rank(
-            body_vec, body_emb, cloth_embs, top_k
-        )
+        sims = torch.matmul(cloth_embs, body_emb.T).squeeze(1).numpy()
 
-        results = []
-        for rank, idx in enumerate(top_idx):
-            p = valid[idx].copy()
-            p.pop("image", None)
-
-            p["similarity"] = float(scores[idx])
-            p["rank"] = rank + 1
-
-            results.append(p)
-
-        return results
-
-
-    # ============================================================
-    # IMAGE MODE (FIXED)
-    # ============================================================
-
-    def recommend(self, user_image_path, products, category, top_k=5):
-
-        print(f"Using preloaded products: {len(products)}")
-
-        # -------------------------
-        # Encode user image
-        # -------------------------
-        user_img = Image.open(user_image_path).convert("RGB")
-        user_emb = self.encode_cloth(user_img)
-
-        # -------------------------
-        # Prepare product embeddings
-        # -------------------------
-        products = download_product_images(products)
-        valid, cloth_embs = self.encode_products(products)
-
-        if not valid:
-            print("No valid products after encoding")
-            return []
-
-        # -------------------------
-        # Similarity
-        # -------------------------
-        sims = torch.matmul(cloth_embs, user_emb.T).squeeze(1).numpy()
-
-        # -------------------------
-        # Ranking
-        # -------------------------
-        top_idx = np.argsort(-sims)[:top_k]
+        top_idx = self._rank(sims, top_k)
 
         results = []
         for rank, idx in enumerate(top_idx):
