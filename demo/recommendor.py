@@ -16,6 +16,23 @@ from model import ViBEModel
 from scrapper import scrape_products, download_product_images
 from body_prior import BodyShapePrior
 
+import subprocess
+import json
+import os
+
+def run_scraper(url):
+    print("Running JS scraper...")
+
+    subprocess.run(
+        ["node", "scrapper/scrapper.js", url],
+        cwd="/content/SMART-WARDROBE"
+    )
+
+    with open("/content/SMART-WARDROBE/products.json") as f:
+        products = json.load(f)
+
+    print(f"Scraped {len(products)} products")
+    return products
 
 UPPER_BODY_TRANSFORM = transforms.Compose([
     transforms.Resize((256, 256)),
