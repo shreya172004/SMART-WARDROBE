@@ -56,7 +56,7 @@ async function scrape(url) {
             }
         }
 
-        console.log("Valid products saved:", validProducts.length);
+        console.log("Saved products:", products.length);
 
         return unique.slice(0, 60);
     } catch (err) {
