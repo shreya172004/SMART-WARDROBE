@@ -123,6 +123,14 @@ class SmartWardrobeRecommender:
                  prior_alpha=0.25,
                  device=None):
 
+        import torchvision.transforms as transforms
+
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+        ])
+
+
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
 
