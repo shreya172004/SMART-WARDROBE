@@ -45,6 +45,78 @@ UPPER_BODY_TRANSFORM = transforms.Compose([
 
 class SmartWardrobeRecommender:
 
+
+    def recommend(self, user_image_path, products, category, top_k=5):
+        import torch
+        from PIL import Image
+        import requests
+        from io import BytesIO
+
+        print(f"Using preloaded products: {len(products)}")
+
+        # -------------------------
+        # Load user image
+        # -------------------------
+        user_img = Image.open(user_image_path).convert("RGB")
+        user_tensor = self.transform(user_img).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            user_embedding = self.model(user_tensor)
+            user_embedding = user_embedding / user_embedding.norm(dim=1, keepdim=True)
+
+        results = []
+
+        # -------------------------
+        # Process products
+        # -------------------------
+        for p in products:
+            try:
+                # download product image
+                resp = requests.get(p["image_url"], timeout=5)
+                img = Image.open(BytesIO(resp.content)).convert("RGB")
+
+                img_tensor = self.transform(img).unsqueeze(0).to(self.device)
+
+                with torch.no_grad():
+                    prod_embedding = self.model(img_tensor)
+                    prod_embedding = prod_embedding / prod_embedding.norm(dim=1, keepdim=True)
+
+                # cosine similarity
+                similarity = torch.mm(user_embedding, prod_embedding.t()).item()
+
+                # -------------------------
+                # OPTIONAL: body prior boost
+                # -------------------------
+                body_score = 0.5  # default neutral
+
+                final_score = 0.7 * similarity + 0.3 * body_score
+
+                results.append({
+                    "name": p.get("name", ""),
+                    "image_url": p.get("image_url", ""),
+                    "product_url": p.get("product_url", ""),
+                    "similarity": similarity,
+                    "final_score": final_score
+                })
+
+            except Exception as e:
+                continue
+
+        # -------------------------
+        # Sort results
+        # -------------------------
+        results = sorted(results, key=lambda x: x["final_score"], reverse=True)
+
+        # add rank
+        for i, r in enumerate(results[:top_k]):
+            r["rank"] = i + 1
+
+        print(f"Returning top {top_k} results")
+
+        return results[:top_k]
+
+
+
     def __init__(self,
                  model_path=None,
                  prior_path=None,
