@@ -4,3 +4,17 @@ __pycache__/
 *.ckpt
 data/
 deepfashion_subset/
+# Node
+scrapper/node_modules/
+
+# Python
+__pycache__/
+*.pyc
+
+# Colab temp
+*.ipynb_checkpoints
+
+# Data / models (optional but recommended)
+*.pth
+*.pkl
+*.json
