@@ -1,5 +1,5 @@
 # ================================================================
-# SmartWardrobe Recommender (FINAL FIXED VERSION)
+# SmartWardrobe Recommender (FINAL CORRECTED VERSION)
 # ================================================================
 
 import sys
@@ -17,6 +17,7 @@ import config
 from model import ViBEModel
 from scrapper import scrape_products, download_product_images
 from body_prior import BodyShapePrior
+from body_encoder import BodyMeasurementExtractor   # 🔥 IMPORTANT
 
 
 # ================================================================
@@ -66,6 +67,9 @@ class SmartWardrobeRecommender:
             self.prior = BodyShapePrior.load(prior_path)
             print(f"Prior loaded (alpha={prior_alpha})")
 
+        # 🔥 Body extractor (used in image mode)
+        self.body_extractor = BodyMeasurementExtractor()
+
 
     # ============================================================
     # ENCODERS
@@ -110,50 +114,48 @@ class SmartWardrobeRecommender:
     # ============================================================
 
     def _rank(self, sims, top_k):
-        idx = np.argsort(-sims)[:top_k]
-        return idx
+        return np.argsort(-sims)[:top_k]
 
 
     # ============================================================
-    # IMAGE MODE
+    # 🔥 MODE 1: BODY FROM IMAGE (CORRECT PIPELINE)
     # ============================================================
 
-    def recommend(self, user_image_path, products, category, top_k=5):
+    def recommend_from_image(self, user_image_path, products, top_k=5):
 
         print(f"Using preloaded products: {len(products)}")
 
-        # Load user image
-        user_img = Image.open(user_image_path).convert("RGB")
-        user_emb = self.encode_cloth(user_img)
+        # 🔥 Step 1: image → body vector
+        body_vec = self.body_extractor.extract(user_image_path)
 
-        # Load product images
+        # fallback if pose fails
+        if np.all(body_vec == 0):
+            print("WARNING: Body extraction failed. Falling back to image similarity.")
+            return self.recommend_visual(user_image_path, products, top_k)
+
+        # 🔥 Step 2: body → embedding
+        body_emb = self.encode_body(body_vec)
+
+        # Step 3: encode products
         products = download_product_images(products)
-
         valid, cloth_embs = self.encode_products(products)
 
         if not valid:
-            print("No valid products after encoding")
             return []
 
-        sims = torch.matmul(cloth_embs, user_emb.T).squeeze(1).numpy()
+        sims = torch.matmul(cloth_embs, body_emb.T).squeeze(1).numpy()
+
+        # 🔥 Step 4: optional prior re-ranking
+        if self.prior is not None:
+            sims = self.prior.rerank(body_vec, cloth_embs.numpy(), sims, alpha=self.prior_alpha)
 
         top_idx = self._rank(sims, top_k)
 
-        results = []
-        for rank, idx in enumerate(top_idx):
-            p = valid[idx].copy()
-            p.pop("image", None)
-
-            p["similarity"] = float(sims[idx])
-            p["rank"] = rank + 1
-
-            results.append(p)
-
-        return results
+        return self._format_results(valid, sims, top_idx)
 
 
     # ============================================================
-    # MEASUREMENT MODE
+    # 🔥 MODE 2: MEASUREMENTS
     # ============================================================
 
     def recommend_from_measurements(
@@ -190,7 +192,6 @@ class SmartWardrobeRecommender:
             print(f"Using preloaded products: {len(products)}")
 
         products = download_product_images(products)
-
         valid, cloth_embs = self.encode_products(products)
 
         if not valid:
@@ -198,9 +199,44 @@ class SmartWardrobeRecommender:
 
         sims = torch.matmul(cloth_embs, body_emb.T).squeeze(1).numpy()
 
+        # prior
+        if self.prior is not None:
+            sims = self.prior.rerank(body_vec, cloth_embs.numpy(), sims, alpha=self.prior_alpha)
+
         top_idx = self._rank(sims, top_k)
 
+        return self._format_results(valid, sims, top_idx)
+
+
+    # ============================================================
+    # ⚠️ MODE 3: PURE VISUAL SIMILARITY (OPTIONAL FALLBACK)
+    # ============================================================
+
+    def recommend_visual(self, user_image_path, products, top_k=5):
+
+        user_img = Image.open(user_image_path).convert("RGB")
+        user_emb = self.encode_cloth(user_img)
+
+        products = download_product_images(products)
+        valid, cloth_embs = self.encode_products(products)
+
+        if not valid:
+            return []
+
+        sims = torch.matmul(cloth_embs, user_emb.T).squeeze(1).numpy()
+
+        top_idx = self._rank(sims, top_k)
+
+        return self._format_results(valid, sims, top_idx)
+
+
+    # ============================================================
+    # RESULT FORMATTER
+    # ============================================================
+
+    def _format_results(self, valid, sims, top_idx):
         results = []
+
         for rank, idx in enumerate(top_idx):
             p = valid[idx].copy()
             p.pop("image", None)
