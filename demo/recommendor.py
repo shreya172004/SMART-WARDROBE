@@ -118,44 +118,70 @@ class SmartWardrobeRecommender:
 
 
     # ============================================================
-    # 🔥 MODE 1: BODY FROM IMAGE (CORRECT PIPELINE)
+    #  MODE 1: BODY FROM IMAGE (CORRECT PIPELINE)
     # ============================================================
 
-    def recommend_from_image(self, user_image_path, products, top_k=5):
+    def recommend(self, user_image_path, products, category, top_k=5):
 
         print(f"Using preloaded products: {len(products)}")
 
-        # 🔥 Step 1: image → body vector
-        body_vec = self.body_extractor.extract(user_image_path)
+        # ============================================================
+        # NEW: IMAGE → BODY VECTOR → BODY ENCODER
+        # ============================================================
+        try:
+            from body_encoder import BodyMeasurementExtractor
+            extractor = BodyMeasurementExtractor()
 
-        # fallback if pose fails
-        if np.all(body_vec == 0):
-            print("WARNING: Body extraction failed. Falling back to image similarity.")
-            return self.recommend_visual(user_image_path, products, top_k)
+            body_vec = extractor.extract(user_image_path)
 
-        # 🔥 Step 2: body → embedding
-        body_emb = self.encode_body(body_vec)
+            # fallback if pose fails
+            if np.all(body_vec == 0):
+                print("Body extraction failed, falling back to visual similarity")
 
-        # Step 3: encode products
+                user_img = Image.open(user_image_path).convert("RGB")
+                user_emb = self.encode_cloth(user_img)
+
+            else:
+                user_emb = self.encode_body(body_vec)
+
+        except Exception as e:
+            print("⚠️ Body pipeline error:", e)
+            print("⚠️ Falling back to visual similarity")
+
+            user_img = Image.open(user_image_path).convert("RGB")
+            user_emb = self.encode_cloth(user_img)
+
+        # ============================================================
+        # EXISTING CODE (UNCHANGED)
+        # ============================================================
+
         products = download_product_images(products)
+
         valid, cloth_embs = self.encode_products(products)
 
         if not valid:
+            print("No valid products after encoding")
             return []
 
-        sims = torch.matmul(cloth_embs, body_emb.T).squeeze(1).numpy()
-
-        # 🔥 Step 4: optional prior re-ranking
-        if self.prior is not None:
-            sims = self.prior.rerank(body_vec, cloth_embs.numpy(), sims, alpha=self.prior_alpha)
+        sims = torch.matmul(cloth_embs, user_emb.T).squeeze(1).numpy()
 
         top_idx = self._rank(sims, top_k)
 
-        return self._format_results(valid, sims, top_idx)
+        results = []
+        for rank, idx in enumerate(top_idx):
+            p = valid[idx].copy()
+            p.pop("image", None)
+
+            p["similarity"] = float(sims[idx])
+            p["rank"] = rank + 1
+
+            results.append(p)
+
+        return results
 
 
     # ============================================================
-    # 🔥 MODE 2: MEASUREMENTS
+    #  MODE 2: MEASUREMENTS
     # ============================================================
 
     def recommend_from_measurements(
