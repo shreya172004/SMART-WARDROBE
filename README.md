@@ -172,8 +172,8 @@ Contributions, suggestions, and bug reports are welcome. Feel free to fork the r
 
 This project was developed through the **equal collaborative efforts** of:
 
-- **Mansi Gupta**
 - **Shreya Mahara**
+- **Mansi Gupta**
 - **Rudra Chandna**
 
 Each contributor played an equally significant role in the design, development, implementation, experimentation, and evaluation of the Smart Wardrobe system.
